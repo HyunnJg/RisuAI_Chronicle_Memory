@@ -1,0 +1,10 @@
+node_modules/
+dist/
+Chronicle_Memory_v*.js
+Chronicle_Control_v*.charx
+Chronicle_Control_v*.risum
+Chronicle_Control_v*.module.json
+.env
+.env.*
+*.log
+.DS_Store

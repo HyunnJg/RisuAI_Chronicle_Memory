@@ -1,0 +1,41 @@
+name: Validate and release
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm run build
+      - run: npm test
+      - run: npm run release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chronicle-release
+          path: dist/*
+  publish:
+    if: github.event_name == 'release'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: chronicle-release
+          path: dist
+      - name: Attach release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

@@ -2,15 +2,15 @@
 
 RisuAI 대화를 일정 턴 단위의 짧은 사건 기록으로 남기는 장기기억 플러그인입니다. 기존 기록을 반복해서 재요약하지 않고 새 구간을 시간순으로 쌓습니다. 캐릭터 RP와 일반 대화에 사용할 수 있으며 특정 작품의 지침을 강제하지 않습니다.
 
-**v0.7.3 · 공개 베타 · RisuAI 플러그인 API 3.0 · GPL-3.0-only**
+**v0.7.4 · 공개 베타 · RisuAI 플러그인 API 3.0 · GPL-3.0-only**
 
-[설치 파일 다운로드](https://github.com/HyunnJg/RisuAI_Chronicle_Memory/releases) · [빠른 시작](QUICK_START_KO.md) · [전체 설정 안내](README_KO.md) · [검증 범위](VALIDATION_v0.7.3.md) · [변경 내역](CHANGELOG.md)
+[설치 파일 다운로드](https://github.com/HyunnJg/RisuAI_Chronicle_Memory/releases) · [빠른 시작](QUICK_START_KO.md) · [전체 설정 안내](README_KO.md) · [검증 범위](VALIDATION_v0.7.4.md) · [변경 내역](CHANGELOG.md)
 
 ## 설치
 
-1. Releases에서 `RisuAI_Chronicle_Memory_v0.7.3.zip`을 받아 압축을 풉니다. 소스만 필요한 경우 GitHub의 Source code도 사용할 수 있습니다.
-2. Risu 설정의 플러그인 관리에서 `Chronicle_Memory_v0.7.3.js`를 가져옵니다. 이전 버전과 동시에 켜지 않습니다.
-3. 모듈 관리에서 `Chronicle_Control_v0.7.3.charx`를 가져와 활성화합니다. `.risum`도 같은 모듈이므로 둘 중 하나만 설치합니다. `.module.json`은 소스 확인용입니다.
+1. Releases에서 `RisuAI_Chronicle_Memory_v0.7.4.zip`을 받아 압축을 풉니다. 소스만 필요한 경우 GitHub의 Source code도 사용할 수 있습니다.
+2. Risu 설정의 플러그인 관리에서 `Chronicle_Memory_v0.7.4.js`를 가져옵니다. 이전 버전과 동시에 켜지 않습니다.
+3. 모듈 관리에서 `Chronicle_Control_v0.7.4.charx`를 가져와 활성화합니다. `.risum`도 같은 모듈이므로 둘 중 하나만 설치합니다. `.module.json`은 소스 확인용입니다.
 4. 플러그인 설정에서 요약 제공자·모델을 연결하고 기억을 켭니다. 모듈에서 값을 바꾸려면 **기억 사용 → 모듈설정 사용**을 선택합니다. 처음에는 기억이 꺼져 있습니다.
 5. 중요한 기존 기록은 JSON으로 백업한 뒤 업데이트하세요. v0.7.2의 설정·키·저장 기록은 그대로 사용합니다.
 
@@ -51,7 +51,7 @@ RisuAI 대화를 일정 턴 단위의 짧은 사건 기록으로 남기는 장�
 - 요약은 원문 일부를 생략할 수 있고 사실성 검증 기능은 아닙니다. 중요한 기록은 확인·편집·백업할 수 있습니다.
 - 병행 모드의 연대기는 Risu 내장 기억 처리 뒤에 추가됩니다. 하이파가 누적 연대기 자체를 다시 줄여주지는 않으므로 최종 컨텍스트 여유를 확보하세요.
 - 병행 모드는 Risu가 이미 제외한 원문을 복원하지 않습니다. 로그의 입력 토큰에는 설정된 최대 출력 토큰 예약도 영향을 줍니다.
-- 플러그인 API 3.0을 기준으로 구현했습니다. 모든 Risu 버전·제공자·다른 플러그인 조합을 실기 검증한 것은 아닙니다. 구체적인 검증 범위는 [검증 문서](VALIDATION_v0.7.3.md)를 확인하세요.
+- 플러그인 API 3.0을 기준으로 구현했습니다. 모든 Risu 버전·제공자·다른 플러그인 조합을 실기 검증한 것은 아닙니다. 구체적인 검증 범위는 [검증 문서](VALIDATION_v0.7.4.md)를 확인하세요.
 
 ## 개발·빌드
 

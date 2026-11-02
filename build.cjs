@@ -41,7 +41,7 @@ const toggles=[
   'chronicle_ctl_delete=저장 기록 확인·삭제: Risu 설정 → Chronicle Memory → 저장된 기억 · 캐시 관리. 캐시는 대화를 이동해도 남습니다. 입력칸을 비우거나 잘못된 값을 넣으면 해당 플러그인 기본값을 사용합니다. 잘못된 값은 플러그인에 경고를 표시합니다.=caption',
   'chronicle_ctl_end==groupEnd'
 ].join('\n');
-const moduleData={name:`Chronicle Control v${version}`,description:'Risu 기본 설정창에서 Chronicle 주기·상한을 조절합니다. Copyright (C) 2026 HyunnJg. GPL-3.0-only; 무보증. LICENSE 및 THIRD_PARTY_NOTICES.md 참조.',
+const moduleData={name:`Chronicle Control v${version}`,description:'Risu 기본 설정창에서 Chronicle 요약 주기·원문 처리·주입 범위를 조절합니다. API·모델·추가 지침은 플러그인에서 설정합니다.',
   id:'chronicle-control-49f59491-2825-4624-ad22-53395a714fa8',namespace:'chronicle-control',lowLevelAccess:false,lorebook:[],assets:[],regex:[],
   customModuleToggle:toggles,trigger:[{comment:'Chronicle native settings sync',type:'start',conditions:[],effect:[{type:'triggerlua',code:fs.readFileSync(path.join(root,'Chronicle_Control.lua'),'utf8')}]}]};
 fs.writeFileSync(path.join(root,`Chronicle_Control_v${version}.module.json`),JSON.stringify(moduleData,null,2));

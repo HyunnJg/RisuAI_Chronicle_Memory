@@ -89,6 +89,14 @@ test('Vertex service account signs JWT, obtains token, and reuses it for inferen
   assert.match(h.calls[1].url,/aiplatform.googleapis.com\/v1\/projects\/project-test\/locations\/global\/publishers\/google/);
   assert(!h.calls[1].options.body.includes('PRIVATE KEY'));
 });
+test('missing browser RSA support explains the Vertex environment failure before sending credentials',async()=>{
+  const vm=require('node:vm');
+  const provider=vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../providers.cjs'),'utf8')+'\nChronicleProviders;',
+    {crypto:{subtle:{digest(){}}},URL,TextEncoder,TextDecoder,console});
+  let calls=0;
+  await assert.rejects(()=>provider.complete({nativeFetch:async()=>{calls++;}},config('vertex'),'not-sent',messages),/Vertex 인증 서명.*HTTPS/);
+  assert.equal(calls,0);
+});
 test('chat module overrides are local and inherit without changing global defaults',()=>{
   const defaults=C.settings({enabled:false});
   const effective=C.chatSettings(defaults,{scriptstate:{$chronicle_enabled:'1',$chronicle_interval:'10',$chronicle_chars:'150',$chronicle_mode:'append'}});

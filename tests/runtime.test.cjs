@@ -4,12 +4,12 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');const vm=require('node:vm');const path=require('node:path');
 const C=require('../core.cjs');
-const P=require('../providers.cjs'),R=require('../retrieval.cjs'),S=require('../storage.cjs');
+const P=require('../providers.cjs'),R=require('../retrieval.cjs'),S=require('../storage.cjs'),E=require('../platform.cjs');
 const chunk=rows=>({from:rows[0].turn,to:rows.at(-1).turn,title:'임무 기록',keywords:['정찰','보상'],events:[{date:'1073.05.03',time:'저녁',summary:'정찰 임무의 보상 조건을 합의함.'}]});
 function raw(n,pending=true){return Array.from({length:n},(_,i)=>[{role:'user',data:`입력${i+1}`,chatId:`u${i+1}`},{role:'char',data:`응답${i+1}`,chatId:`a${i+1}`}]).flat().concat(pending?[{role:'user',data:'다음',chatId:`u${n+1}`}]:[]);}
 function formatted(r){return [{role:'system',content:'규칙'},...r.map(m=>({role:m.role==='char'?'assistant':'user',content:m.data,memo:m.chatId}))];}
 async function setup(override={},change={}){
-  const store=new Map([['risu-chronicle:v1:settings',JSON.stringify(C.settings({enabled:true,...override}))]]);
+  const store=change.store||new Map([['risu-chronicle:v1:settings',JSON.stringify(C.settings({enabled:true,...override}))]]);
   const char={type:'character',chaId:'character-1',name:'테스트 캐릭터',chatPage:0,chats:[{id:'chat-1',name:'대화',message:raw(10)}]};
   const hooks={},calls=[],writes=[];let registrations=0;
   const api={pluginStorage:{getItem:async k=>store.get(k),setItem:async(k,v)=>{writes.push({key:k,value:v});store.set(k,v);},keys:async()=>[...store.keys()],removeItem:async k=>store.delete(k)},
@@ -20,7 +20,7 @@ async function setup(override={},change={}){
       const data=JSON.parse(opts.messages[1].content);return {type:'success',result:JSON.stringify(chunk(data))};},
     nativeFetch:async(url,opts)=>{calls.push({url,opts});if(change.onFetch)return change.onFetch(url,opts,char);return change.externalResponse || new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))}}]}),{status:200});}
   };
-  const sandbox={risuai:api,ChronicleCore:C,ChronicleProviders:P,ChronicleRetrieval:R,ChronicleStorage:S,structuredClone,TextEncoder,crypto:globalThis.crypto,
+  const sandbox={risuai:api,ChronicleCore:C,ChronicleProviders:P,ChronicleRetrieval:R,ChronicleStorage:S,ChroniclePlatform:{...E,assertMemory:()=>E.assertMemory('environment'in change?change.environment:globalThis)},structuredClone,TextEncoder,crypto:globalThis.crypto,
     setTimeout:change.timers?((fn,ms)=>{change.timers.push(ms);return setTimeout(fn,ms);}):setTimeout,clearTimeout,URL,Response,console};
   await vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../runtime.js'),'utf8'),sandbox);
   return {store,char,hooks,calls,writes,registrations,getState:()=>JSON.parse(store.get('risu-chronicle:v1:chat:character-1:chat-1')||'null'),getRecall:()=>JSON.parse(store.get('risu-chronicle:v1:recall:character-1:chat-1')||'null'),getVectors:()=>JSON.parse(store.get('risu-chronicle:v1:vectors:character-1:chat-1')||'{"entries":{}}')};
@@ -28,6 +28,34 @@ async function setup(override={},change={}){
 test('plugin registers UI and main hook; auxiliary requests pass through',async()=>{
   const h=await setup();assert.equal(h.registrations,2);
   const input=formatted(raw(10));assert.equal(await h.hooks.beforeRequest(input,'memory'),input);assert.equal(h.calls.length,0);
+});
+test('unavailable Web Crypto skips memory visibly and keeps the exact RP input',async()=>{
+  const h=await setup({}, {environment:{isSecureContext:false,crypto:{}}});const input=formatted(h.char.chats[0].message);
+  assert.equal(await h.hooks.beforeRequest(input,'model'),input);assert.equal(h.calls.length,0);assert.equal(h.getState(),null);
+  const health=JSON.parse(h.store.get('risu-chronicle:v1:health'));assert.equal(health.status,'skipped');assert.match(health.message,/HTTPS/);
+  assert(h.writes.every(row=>!row.key.includes(':chat:')&&!row.key.includes(':vectors:')));
+});
+test('disabled memory passes through an unsupported browser without creating warnings or API calls',async()=>{
+  const h=await setup({enabled:false},{environment:{crypto:{}}});const input=formatted(h.char.chats[0].message);
+  assert.equal(await h.hooks.beforeRequest(input,'model'),input);assert.equal(h.calls.length,0);assert.equal(h.writes.length,0);
+});
+test('completed chunks survive a failed later batch and reload retries only the remaining chunk',async()=>{
+  let calls=0;const first=await setup({batchesPerRequest:2},{onCall:async opts=>{
+    calls++;return calls===2?{type:'fail',result:'temporary interruption'}:{type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+  }});
+  await first.hooks.beforeRequest(formatted(first.char.chats[0].message),'model');const id=first.getState().entries[0].id;
+  assert.equal(C.covered(first.getState()),5);assert.equal(JSON.parse(first.store.get('risu-chronicle:v1:health')).status,'warning');
+  const resumed=await setup({}, {store:first.store});await resumed.hooks.beforeRequest(formatted(resumed.char.chats[0].message),'model');
+  assert.equal(resumed.calls.length,1);assert.deepEqual(JSON.parse(resumed.calls[0].messages[1].content).map(row=>row.turn),[6,7,8,9,10]);
+  assert.equal(C.covered(resumed.getState()),10);assert.equal(resumed.getState().entries[0].id,id);
+  assert.equal(JSON.parse(resumed.store.get('risu-chronicle:v1:health')).status,'ok');
+});
+test('processing status is persisted while a summary is pending, without a timeout or duplicate call',async()=>{
+  let finish,started;const began=new Promise(r=>started=r),release=new Promise(r=>finish=r);
+  const h=await setup({}, {onCall:async opts=>{started();await release;return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};}});
+  const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began;
+  assert.equal(JSON.parse(h.store.get('risu-chronicle:v1:health')).status,'running');assert.equal(h.calls.length,1);
+  finish();await task;assert.equal(JSON.parse(h.store.get('risu-chronicle:v1:health')).status,'ok');assert.equal(h.calls.length,1);
 });
 test('native submodel generates a chunk, injects it, and preserves recent raw',async()=>{
   const h=await setup();const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');

@@ -6,14 +6,14 @@ const {deflateRawSync}=require('node:zlib');
 const root=__dirname,version=require('./package.json').version;
 execFileSync(process.execPath,['build.cjs'],{cwd:root,stdio:'inherit'});
 const files=[
- 'core.cjs','providers.cjs','retrieval.cjs','storage.cjs','runtime.js','Chronicle_Control.lua',
+ 'core.cjs','providers.cjs','retrieval.cjs','storage.cjs','platform.cjs','runtime.js','Chronicle_Control.lua',
  'build.cjs','release.cjs','package.json','README.md','README_KO.md','QUICK_START_KO.md',
  'CHANGELOG.md','RELEASE_NOTES.md',`VALIDATION_v${version}.md`,
  'LICENSE','THIRD_PARTY_NOTICES.md','RPACK_UPSTREAM_LICENSE.txt','RPACK_LICENSE.txt','rpack_map.bin',
  '.gitignore','.github/ISSUE_TEMPLATE/bug_report.md','.github/workflows/release.yml',
  `Chronicle_Memory_v${version}.js`,`Chronicle_Control_v${version}.charx`,
  `Chronicle_Control_v${version}.risum`,`Chronicle_Control_v${version}.module.json`,
- ...['core','embeddings','providers','retrieval','runtime','storage'].map(name=>`tests/${name}.test.cjs`)
+ ...['core','embeddings','providers','retrieval','runtime','storage','platform'].map(name=>`tests/${name}.test.cjs`)
 ];
 function crc32(buf){let value=0xffffffff;for(const b of buf){value^=b;for(let bit=0;bit<8;bit++)value=(value>>>1)^((value&1)?0xedb88320:0);}return (value^0xffffffff)>>>0;}
 function zip(files){

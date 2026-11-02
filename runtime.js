@@ -3,10 +3,11 @@
 /* Runtime adapter for RisuAI API 3.0. Bundled after core.cjs. */
 (async () => {
   'use strict';
-  const C=ChronicleCore, P=ChronicleProviders, R=ChronicleRetrieval, api=globalThis.risuai || globalThis.Risuai;
+  const C=ChronicleCore, P=ChronicleProviders, R=ChronicleRetrieval, E=ChroniclePlatform, api=globalThis.risuai || globalThis.Risuai;
   if (!api) throw Error('RisuAI API 3.0이 필요합니다.');
-  const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:';
+  const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:', HEALTH=NS+'health';
   let serial=Promise.resolve(), lastStatus='준비됨', uiContext=null, uiState=null, failedUntil=new Map(), embeddingFailedUntil=new Map(),recoveringConfig=false;
+  let activeOperation=null,lastHealth=null,preparedBackup=null;
   const exclusive=fn=>{
     const task=serial.then(fn); serial=task.catch(()=>{}); return task;
   };
@@ -16,6 +17,19 @@
     return typeof value==='string'?JSON.parse(value):value;
   }
   const save=(key,value)=>api.pluginStorage.setItem(key,JSON.stringify(value));
+  function renderHealth() {
+    if(typeof document==='undefined')return;
+    const panel=document.getElementById('health');if(!panel)return;
+    const env=E.memoryError(),h=lastHealth;
+    const label={running:'요약 처리 중',ok:'기억 처리 정상',warning:'주의 · 기억 처리 일부 실패',skipped:'기억 처리 건너뜀'}[h?.status]||'아직 처리 기록 없음';
+    const pending=h?.status==='running'&&!activeOperation?'이전 요약의 완료 여부를 확인하지 못했습니다. 저장된 기록까지 유지하며 다음 RP 요청 또는 미처리 구간 요약에서 남은 구간을 확인합니다. 다른 탭에서 처리 중이라면 완료 후 확인하세요.':h?.message||'';
+    panel.textContent=[env||label,h?.at?`마지막 기록: ${new Date(h.at).toLocaleString()}`:'',pending].filter(Boolean).join('\n');
+    panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!activeOperation)?'true':'false';
+  }
+  async function health(status,message) {
+    lastHealth={status,message:P.safeError(message),at:new Date().toISOString()};renderHealth();
+    try{await save(HEALTH,lastHealth);}catch{/* Diagnostics must not block RP or overwrite narrative state. */}
+  }
   const D=ChronicleStorage.create(api.pluginStorage,NS,{validVector:R.validVector,entryHash:entry=>C.digest(R.document(entry))});
   async function config(recover=false){
     try{return C.settings(await read(SETTINGS,C.DEFAULTS));}
@@ -36,7 +50,7 @@
   let draftProfiles={}, draftSecrets={}, visibleProvider='submodel',draftEmbeddingProfiles={},draftEmbeddingSecrets={},visibleEmbeddingProvider='gemini';
   const EMBEDDING_KEYS=['embeddingModel','embeddingEndpoint','embeddingProject','embeddingLocation','embeddingVertexMethod','embeddingReuseCredential'];
   const PROFILE_KEYS=['endpoint','model','project','location','publisher','tokenField','anthropicVersion'];
-  async function context() {
+  async function conversation() {
     const characterIndex=await api.getCurrentCharacterIndex();
     const char=await api.getCharacter();
     if (!char || char.type==='group') throw Error('첫 버전은 1:1 캐릭터 대화만 지원합니다.');
@@ -44,7 +58,11 @@
     if (!char.chaId || !chat?.id || !Array.isArray(chat.message)) throw Error('캐릭터/대화의 고유 ID를 확인할 수 없습니다. 대화를 저장하고 다시 시도하세요.');
     if(characterIndex!==await api.getCurrentCharacterIndex() || chatIndex!==await api.getCurrentChatIndex()) throw Error('대화가 전환되었습니다. 다시 시도하세요.');
     const key=NS+'chat:'+encodeURIComponent(char.chaId)+':'+encodeURIComponent(chat.id);
-    return {key,characterIndex,chatIndex,charId:char.chaId,chatId:chat.id,charName:char.name,chatName:chat.name,chat,tl:await C.timeline(chat.message)};
+    return {key,characterIndex,chatIndex,charId:char.chaId,chatId:chat.id,charName:char.name,chatName:chat.name,chat};
+  }
+  async function context() {
+    E.assertMemory();const ctx=await conversation();
+    return {...ctx,tl:await C.timeline(ctx.chat.message)};
   }
   async function persistState(ctx,state) {
     await D.sync(ctx.key,state);
@@ -116,17 +134,21 @@
       const failureKey=ctx.key+':'+batch.at(-1).hash;
       if(!force && (failedUntil.get(failureKey)||0)>Date.now()) break;
       try {
+        activeOperation={from:batch[0].number,to:batch.at(-1).number};
+        await health('running',`T${activeOperation.from}~T${activeOperation.to} 요약 응답 대기 중입니다. 화면을 끄거나 탭을 이동하면 처리가 지연·중단될 수 있습니다. 응답을 기다리는 동안 중복 호출하지 않습니다.`);
         const result=await summarize(batch,s,ctx);
         await unchanged(ctx);
         current=C.commit(current,batch,result.text);current.lastSummaryInput=result.stats;
         await persistState(ctx,current); failedUntil.delete(failureKey);
         lastStatus=`T${batch[0].number}~T${batch.at(-1).number} 기록 완료`;
+        await health('ok',lastStatus);
       } catch(e) {
         failedUntil.set(failureKey,Date.now()+60000);
         current.lastError=e.message; await persistState(ctx,current);
         lastStatus=e.message;
+        await health('warning','요약 실패 · 저장된 기억과 미처리 원문을 유지합니다. '+P.safeError(e));
         break; // The failed chunk and every later chunk stay verbatim.
-      }
+      }finally{activeOperation=null;renderHealth();}
     }
     return current;
   }
@@ -198,8 +220,9 @@
     if(type!=='model'||messages.some(m=>m.memo==='risu-chronicle-summary-v1'))return messages;
     return exclusive(async()=>{
       try{
-        const global=await config(),ctx=await context(),s=C.chatSettings(global,ctx.chat);
+        const global=await config(),base=await conversation(),s=C.chatSettings(global,base.chat);
         if(!s.enabled)return messages;
+        E.assertMemory();const ctx={...base,tl:await C.timeline(base.chat.message)};
         const initial=await stateFor(ctx),state=await generate(ctx,initial,s);
         await unchanged(ctx);
         const result=s.mode==='hybrid'&&state.entries.length?await recall(ctx,state,s):{text:'',warnings:[]};
@@ -208,19 +231,25 @@
         const out=C.inject(messages,state,ctx.tl,s,text=>warnings.push(text),result.text),warning=warnings.join('\n');
         if((state.lastWarning||'')!==warning){state.lastWarning=warning;await persistState(ctx,state);}
         if(warning)lastStatus=warning;
+        await health(state.lastError||warning?'warning':'ok',state.lastError?'요약 실패 구간은 처리하지 않은 원문으로 유지합니다. '+P.safeError(state.lastError):warning||'설정에 따라 기억 처리를 완료했습니다.');
         return out;
       }catch(e){
-        if(e.code==='CHRONICLE_CONTEXT_CHANGED')throw e;
+        if(e.code==='CHRONICLE_CONTEXT_CHANGED'){await health('warning','대화·원문이 바뀌어 오래된 결과를 사용하지 않았습니다. 다시 요청하세요.');throw e;}
         lastStatus='기억 처리를 건너뛰고 원래 RP 요청을 유지했습니다: '+P.safeError(e);
+        // Unsupported groups continue without a warning write, as before.
+        if(!String(e.message).includes('1:1 캐릭터'))await health('skipped',lastStatus);
         return messages;
       }
     });
   }
   const $=id=>document.getElementById(id);
   function notify(text) {lastStatus=text; if($('status')) $('status').textContent=text;}
-  function download(name,value) {
-    const blob=new Blob([JSON.stringify(value,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');
-    a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  function prepareBackup(name,value) {
+    E.releaseBackup(preparedBackup);preparedBackup=E.backup(value);
+    $('backupText').value=preparedBackup.text;$('backupReady').hidden=false;
+    const link=$('backupDownload');link.hidden=!preparedBackup.url;
+    if(preparedBackup.url){link.href=preparedBackup.url;link.download=name;}else link.removeAttribute('href');
+    notify('백업 JSON을 준비했습니다. 저장 링크를 직접 누르거나 JSON 전체를 복사하세요. 실제 파일 저장 완료 여부는 브라우저에서 확인해야 합니다.');
   }
   function values() {
     return C.settings({enabled:$('enabled').checked,interval:Number($('interval').value),recent:Number($('recent').value),
@@ -404,6 +433,8 @@
   }
   async function open() {
     const s=await config(true);
+    try{lastHealth=await read(HEALTH,null);}catch{lastHealth=null;}
+    E.releaseBackup(preparedBackup);preparedBackup=null;
     recoveringConfig=!!s.configWarning;
     draftProfiles=structuredClone(s.profiles || {});
     draftProfiles[s.provider]={...P.defaults(s.provider),...draftProfiles[s.provider],...Object.fromEntries(PROFILE_KEYS.map(k=>[k,s[k]]))};
@@ -419,8 +450,13 @@
       input,select,textarea{width:100%;background:#0e1723;color:#edf5ff;border:1px solid #456079;border-radius:6px;padding:9px;font:inherit}
       input[type=checkbox]{width:auto}textarea{display:block;resize:vertical;margin-top:6px}button{background:#a8dfcb;color:#10221c;border:0;border-radius:6px;padding:10px 15px;font-weight:700;cursor:pointer}
       button.secondary{background:#34475d;color:#edf5ff}button:disabled{opacity:.5;cursor:wait}.row{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
-      [hidden]{display:none!important}#status{white-space:pre-wrap;padding:12px;background:#24384a;border-radius:6px;overflow-wrap:anywhere}small{color:#b5c6d9}summary{cursor:pointer}.chunkEditor{border-top:1px solid #456079;padding:14px 0}#effectiveSettings{display:block;white-space:pre-wrap;overflow-wrap:anywhere}`+'</style>';
-    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.2</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small><br><small>© 2026 HyunnJg · <a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0</a> · 수정·재배포 가능 · 무보증</small></div><button id="close" class="secondary">닫기</button></header>
+      [hidden]{display:none!important}#status{white-space:pre-wrap;padding:12px;background:#24384a;border-radius:6px;overflow-wrap:anywhere}small{color:#b5c6d9}summary{cursor:pointer}.chunkEditor{border-top:1px solid #456079;padding:14px 0}#effectiveSettings{display:block;white-space:pre-wrap;overflow-wrap:anywhere}
+      #environment,#health{white-space:pre-wrap;overflow-wrap:anywhere}#health{padding:12px;background:#203e35;border-left:4px solid #a8dfcb}#health[data-warning=true]{background:#493326;border-color:#f1b77c}
+      .downloadLink{display:inline-block;min-height:44px;padding:10px 15px;background:#a8dfcb;color:#10221c;border-radius:6px;font-weight:700;text-decoration:underline}
+      input,select,textarea{font-size:16px;min-width:0}button{min-height:44px}header>div{min-width:0}main,section{overflow-wrap:anywhere}
+      @media(max-width:600px){main{padding:12px}section{padding:14px}header{flex-wrap:wrap;align-items:flex-start}h1{font-size:22px}.grid{grid-template-columns:minmax(0,1fr)}.row>button{max-width:100%}}`+'</style>';
+    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.3</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small><br><small>© 2026 HyunnJg · <a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0</a> · 수정·재배포 가능 · 무보증</small></div><button id="close" class="secondary">닫기</button></header>
+      <section><h2>실행 환경 · 최근 기억 처리</h2><p id="health" role="status"></p><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다.</p></details></section>
       <section><h2>이 기억은 어떻게 동작하나요?</h2><p>대화 원문을 설정한 턴 수만큼 묶어 짧은 사건 기록으로 바꾸고, 이전 사건 기록 전체와 최근 원문을 다음 RP 요청에 함께 보냅니다. 오래된 로그를 반복해서 다시 요약하지 않습니다.</p>
       <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다.</p>
       <p><strong>Risu 기억 병행 · 하이파 주력</strong>은 원문 관리와 과거 검색을 Risu에 맡기고, 같은 주기로 만든 짧은 연대기를 덧붙입니다. 기본은 턴당 50글자 목표·누적 로그 전체 주입이며 최근 K청크·기록만도 선택할 수 있습니다. 기존 단독·자체 하이브리드 설정은 그대로 유지합니다.</p>
@@ -487,6 +523,7 @@
       <section><h2>현재 대화의 기억</h2><p id="chatTitle"></p><div class="row"><button id="reload" class="secondary">현재 대화 불러오기</button><button id="generate">미처리 구간 요약</button><button id="saveLog">수정한 로그 저장</button></div>
       <p>자동 처리는 새 구간을 덧붙입니다. 원문이 달라진 구간은 보관함으로 이동하며 RP에는 주입하지 않습니다.</p><div id="entries"></div>
       <div class="row"><button id="export" class="secondary">현재 대화 JSON 백업</button><button id="importButton" class="secondary">JSON 복원</button><input id="importFile" type="file" accept="application/json,.json" hidden></div>
+      <div id="backupReady" hidden><p>백업 준비 완료 · 아래 링크를 직접 눌러 저장하세요. 파일 저장이 안 되면 JSON 전체를 복사해 별도로 보관할 수 있습니다.</p><div class="row"><a id="backupDownload" class="downloadLink" download="Chronicle_Memory_Backup.json" hidden>JSON 파일 저장</a><button id="selectBackup" class="secondary">JSON 전체 선택</button></div><textarea id="backupText" rows="8" readonly aria-label="백업 JSON 전체"></textarea><small>선택한 JSON에는 대화의 요약 기록이 들어 있습니다. 파일 앱에서 저장 결과를 확인하세요.</small></div>
       <p>복원 시 현재 원문과 맞는 구간만 활성화합니다. 기존 기억은 보관함에 남습니다. API 키·벡터·검색 결과는 백업하지 않으며 필요하면 다시 색인합니다.</p></section>
       <section><h2>누적 로그 · 검색 재강조 미리보기</h2><small id="counts"></small><textarea id="preview" rows="10" readonly></textarea><p id="recallState"></p><textarea id="recallPreview" rows="7" readonly placeholder="하이브리드에서 선택된 기존 요약 청크"></textarea></section><p id="status" role="status"></p></main>`;
     $('status').insertAdjacentHTML('beforebegin',`<section><h2>저장된 기억 · 캐시 관리</h2>
@@ -517,7 +554,7 @@
     $('serviceFile').onchange=async()=>{
       const file=$('serviceFile').files?.[0];if(!file)return;
       try{if(file.size>128*1024)throw Error('서비스 계정 JSON은 128KB 이하만 지원합니다.');
-        const value=await file.text(),sa=P.serviceAccount(value);$('serviceAccount').value=value;if(sa.project_id)$('project').value=sa.project_id;notify('서비스 계정 JSON을 읽었습니다. 설정 저장을 누르세요.');
+        const value=await E.readFile(file),sa=P.serviceAccount(value);$('serviceAccount').value=value;if(sa.project_id)$('project').value=sa.project_id;notify('서비스 계정 JSON을 읽었습니다. 설정 저장을 누르세요.');
       }catch(e){notify(P.safeError(e));}
     };
     action('loadModels',async()=>{
@@ -532,7 +569,8 @@
       await P.complete(api,{...cfg,maxOutputTokens:Math.max(cfg.maxOutputTokens,128)},await credential(cfg.provider),[{role:'system',content:'Return exactly the JSON object {"ok":true}. No other text.'},{role:'user',content:'Connection test.'}]);
       notify('연결 성공 · 모델에서 텍스트 응답을 받았습니다.');
     });
-    $('close').onclick=()=>api.hideContainer();
+    $('close').onclick=()=>{E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
+    $('selectBackup').onclick=()=>{$('backupText').focus();$('backupText').select();$('backupText').setSelectionRange(0,$('backupText').value.length);notify('JSON 전체를 선택했습니다. 기기의 복사 기능으로 보관하세요.');};
     action('saveSettings',saveSettings);
     action('saveEmbeddingSettings',saveSettings);
     action('loadEmbeddingModels',async()=>{
@@ -618,15 +656,15 @@
       next.summaryWarnings=[];await D.clearRecall(uiContext.key);next.revision++;C.validateState(next);await persistState(uiContext,next);await loadEditor();await loadCaches();notify('수정한 사건 로그 저장 완료');
     });
     action('export',async()=>{
-      const latest=await editorUnchanged();download('Chronicle_Memory_Backup.json',{format:'risu-chronicle-backup',version:1,
-        exportedAt:new Date().toISOString(),sourceKey:uiContext.key,charName:uiContext.charName,chatName:uiContext.chatName,state:C.stripDerivedState(latest)});notify('현재 대화 JSON 백업 완료');
+      const latest=await editorUnchanged();prepareBackup('Chronicle_Memory_Backup.json',{format:'risu-chronicle-backup',version:1,
+        exportedAt:new Date().toISOString(),sourceKey:uiContext.key,charName:uiContext.charName,chatName:uiContext.chatName,state:C.stripDerivedState(latest)});
     });
     $('importButton').onclick=()=>$('importFile').click();
     $('importFile').onchange=async()=>{
       const file=$('importFile').files?.[0];if(!file) return;
       try {await exclusive(async()=>{
         if(file.size>10*1024*1024) throw Error('백업 파일은 10MB 이하만 지원합니다.');
-        const data=JSON.parse(await file.text());
+        const data=JSON.parse(await E.readFile(file));
         if(data.format!=='risu-chronicle-backup' || data.version!==1) throw Error('Chronicle 백업 형식이 아닙니다.');
         const ctx=await context(),old=await stateFor(ctx),restored=C.compatiblePrefix(C.validateState(data.state),ctx.tl);
         if(C.covered(restored)===0 && data.state.entries.length>0) throw Error('현재 대화와 일치하는 원문 구간이 없습니다. 복원하지 않았습니다.');
@@ -636,10 +674,17 @@
         restored.revision=old.revision+1;await persistState(ctx,restored);await loadEditor();await loadCaches();notify('원문과 일치하는 기억을 복원했습니다.');
       });}catch(e){notify(e.message);}finally{$('importFile').value='';}
     };
+    $('environment').textContent=E.description();renderHealth();
     await refreshEditor();try{await loadCaches();}catch(e){notify(P.safeError(e));}
     await api.showContainer('fullscreen');
   }
   await api.addRisuReplacer('beforeRequest',beforeRequest);
   await api.registerSetting('Chronicle Memory',()=>exclusive(open),'📜','html');
   await api.registerButton({name:'Chronicle Memory',icon:'📜',iconType:'html',location:'chat'},()=>exclusive(open));
+  if(typeof document!=='undefined'&&typeof document.addEventListener==='function')document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState!=='hidden'){
+      renderHealth();
+      if(activeOperation&&document.getElementById('status'))notify(`T${activeOperation.from}~T${activeOperation.to} 요약 응답을 기다리고 있습니다. 자동으로 중복 재시도하지 않습니다.`);
+    }
+  });
 })();

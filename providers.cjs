@@ -64,6 +64,7 @@ const ChronicleProviders=(()=>{
     return body;
   }
   async function vertexToken(api,credential) {
+    if(typeof globalThis.crypto?.subtle?.importKey!=='function'||typeof globalThis.crypto?.subtle?.sign!=='function')throw Error('이 환경에서는 Vertex 인증 서명을 사용할 수 없습니다. HTTPS 접속과 최신 브라우저의 Web Crypto 지원을 확인하세요.');
     const sa=serviceAccount(credential),cacheKey=sa.client_email+'\n'+sa.private_key;
     const cached=tokenCache.get(cacheKey);if(cached?.expires>Date.now()+60000)return {token:cached.token,sa};
     const now=Math.floor(Date.now()/1000),pem=sa.private_key.replace(/-----[^-]+-----/g,'').replace(/\s/g,'');

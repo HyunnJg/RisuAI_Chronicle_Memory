@@ -1,6 +1,14 @@
-# Chronicle Memory v0.7.2
+# Chronicle Memory v0.7.3
 
 새 구간만 압축해 시간순 사건 로그에 덧붙이는 RisuAI API 3.0 플러그인입니다. 단독과 하이브리드 모두 **누적 요약 로그 전체 + 최근 N턴 원문 + 현재 입력**을 보냅니다. 자체 하이브리드는 관련 요약 청크를 검색해 현재 입력 가까이에 다시 제시합니다. 새 **Risu 기억 병행 · 하이파 주력**은 원문·과거 검색을 Risu에 맡기고 짧은 연대기를 덧붙입니다.
+
+## v0.7.3 웹·모바일 안전장치
+
+- 설정창 상단에 환경 진단과 최근 기억 처리 결과를 표시하고 작은 별도 상태로 저장합니다. Web Crypto 미지원 시 원문을 자르지 않고 RP를 통과시키며 HTTPS·최신 브라우저 안내를 남깁니다.
+- JSON 백업은 먼저 준비한 뒤 사용자가 저장 링크를 직접 누릅니다. 임시 URL을 1초 뒤 자동 폐기하지 않으며 새 백업·설정창 닫기에서 해제합니다. 다운로드 미지원 시 JSON 전체 선택·복사를 제공합니다. 파일 읽기는 File.text와 FileReader를 지원합니다.
+- 요약 중 상태를 남기고 응답 대기 중 중복 재시도하지 않습니다. 저장 완료 청크는 유지하고 재시작 시 남은 구간부터 확인합니다. 화면 잠금 중 실행 지속과 기기·탭 간 동시 호출 조정은 보장하지 않습니다.
+- 좁은 화면에서는 설정을 한 열로 배치하고 입력 글자·버튼 터치 영역을 늘렸습니다. 원문 전체 해시 검증·요약 정책·캐시 키는 유지합니다.
+- 실제 Risu 웹·PocketRisu·Android·iOS 검증은 하지 않았습니다. 자동 테스트·DOM 모의 검증 결과는 검증 문서에서 구분합니다.
 
 ## v0.7.2 공개 배포 정리
 
@@ -53,8 +61,8 @@
 ## 설치·업데이트
 
 1. 중요한 기록은 기존 버전에서 JSON 백업을 받아둡니다.
-2. `Chronicle_Memory_v0.7.2.js`로 플러그인을 업데이트하고 이전 플러그인을 동시에 켜지 않습니다.
-3. 이전 Control 모듈을 끄고 **모듈 관리**에서 `Chronicle_Control_v0.7.2.charx`를 가져와 활성화합니다. `.risum`은 같은 기능의 대안이며 둘 중 하나만 설치합니다. `.module.json`은 소스 확인용입니다.
+2. `Chronicle_Memory_v0.7.3.js`로 플러그인을 업데이트하고 이전 플러그인을 동시에 켜지 않습니다.
+3. 이전 Control 모듈을 끄고 **모듈 관리**에서 `Chronicle_Control_v0.7.3.charx`를 가져와 활성화합니다. `.risum`은 같은 기능의 대안이며 둘 중 하나만 설치합니다. `.module.json`은 소스 확인용입니다.
 4. 단독·자체 하이브리드는 Risu 내장 기억을 끕니다. **Risu 기억 병행은 하이파 등 내장 기억을 Risu에서 직접 켭니다.** 플러그인은 내장 기억 설정을 대신 변경하지 않습니다.
 5. 플러그인 설정 → Chronicle Memory에서 요약 모델을 연결합니다. 하이브리드는 임베딩 모델도 연결합니다.
 6. Risu 기본 토글 영역 → 📜 Chronicle Memory → **기억 사용: 모듈설정 사용**을 선택합니다.
@@ -181,9 +189,9 @@ JSON 백업에는 활성 로그·수동 편집·보관함을 넣고 **벡터·�
 
 ## 검증·소스
 
-`npm run build` 후 `npm test`를 실행합니다. 외부 build 의존성은 없습니다. `VALIDATION_v0.7.2.md`에 검증 범위를 기록했습니다. 실제 계정 API를 추가 호출하지 않았으며 실제 Risu 설치판의 새 통합 동작·모델 품질은 재실험이 필요합니다.
+`npm run build` 후 `npm test`를 실행합니다. 외부 build 의존성은 없습니다. `VALIDATION_v0.7.3.md`에 검증 범위를 기록했습니다. 실제 계정 API를 추가 호출하지 않았으며 실제 Risu 설치판의 새 통합 동작·모델 품질은 재실험이 필요합니다.
 
-소스: core.cjs(턴·요약·주입), providers.cjs(API), retrieval.cjs(검색), storage.cjs(분리 캐시), runtime.js(UI·호출), Chronicle_Control.lua(모듈), build.cjs(설치 파일).
+소스: core.cjs(턴·요약·주입), providers.cjs(API), retrieval.cjs(검색), storage.cjs(분리 캐시), platform.cjs(환경·파일 기능), runtime.js(UI·호출), Chronicle_Control.lua(모듈), build.cjs(설치 파일).
 
 검토한 Risu 소스 기준은 ea61945f9038e0189807d075f55f4e66ab7e98bf입니다. 프로젝트 코드는 GPL-3.0-only입니다. RPack 매핑의 Risu용 MIT 선택 조건과 원문은 THIRD_PARTY_NOTICES.md, RPACK_UPSTREAM_LICENSE.txt, RPACK_LICENSE.txt에 있습니다. 다른 앱으로 이식할 때에는 RPack의 별도 조건을 먼저 확인하세요.
 

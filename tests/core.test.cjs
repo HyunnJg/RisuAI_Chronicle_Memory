@@ -15,6 +15,63 @@ async function stateWith(n=5,all=10) {
   const tl=await C.timeline(raw(all,true));
   return {tl,state:C.commit(C.emptyState(),tl.turns.slice(0,n),'T1: 금화 20개 수령. T5: 영주에게 보고.')};
 }
+test('raw trimming defaults to rolling and supports validated module inheritance and overrides',()=>{
+  assert.equal(C.settings({}).rawTrim,'rolling');assert.equal(C.settings({rawTrim:'chunk'}).rawTrim,'chunk');
+  for(const rawTrim of [null,1,'unknown'])assert.throws(()=>C.settings({rawTrim}));
+  const defaults=C.settings({rawTrim:'chunk'});
+  assert.equal(C.chatSettings(defaults,{scriptstate:{$chronicle_raw_trim:'inherit'}}).rawTrim,'chunk');
+  assert.equal(C.chatSettings(defaults,{scriptstate:{$chronicle_raw_trim:'rolling'}}).rawTrim,'rolling');
+  const invalid=C.chatSettings(defaults,{scriptstate:{$chronicle_raw_trim:'bad'}});
+  assert.equal(invalid.rawTrim,'chunk');assert.match(invalid.settingWarnings[0],/chronicle_raw_trim/);
+});
+test('staircase keeps its raw start until each commit for independent intervals and recent windows',async()=>{
+  for(const interval of [5,10])for(const recent of [5,7,20]){
+    const s=C.settings({interval,recent,rawTrim:'chunk'});let state=C.emptyState();
+    for(let n=1;n<=31;n++){
+      const tl=await C.timeline(raw(n,true));let batch;
+      while((batch=C.nextBatch(state,tl,s)).length)state=C.commit(state,batch,'청크 '+batch.at(-1).number);
+      const start=Math.max(0,C.covered(state)-recent),out=C.inject(messages(raw(n,true)),state,tl,s);
+      assert.equal(C.rawStart(state,tl,s),start);
+      assert.equal(out.filter(m=>m.role==='assistant').length,n-start);
+      assert(out.some(m=>m.memo===`u${n+1}`));
+      for(let i=C.covered(state)+1;i<=n;i++)assert(out.some(m=>m.memo===`a${i}`));
+    }
+  }
+});
+test('staircase preserves the formatted prompt prefix between commits while rolling moves it',async()=>{
+  const tl10=await C.timeline(raw(10));let state=C.commit(C.emptyState(),tl10.turns.slice(0,5),'초반 기록');
+  state=C.commit(state,tl10.turns.slice(5,10),'다음 기록');let previous;
+  for(let n=10;n<=14;n++){
+    const source=[...raw(n),{role:'user',data:`사용자 ${n+1}`,chatId:`u${n+1}`}],tl=await C.timeline(source);
+    const out=C.inject(messages(source),state,tl,C.settings({rawTrim:'chunk'}));
+    assert.equal(C.rawStart(state,tl,C.settings({rawTrim:'chunk'})),5);
+    if(previous)assert.deepEqual(out.slice(0,previous.length-1),previous.slice(0,-1));
+    const rolling=C.inject(messages(source),state,tl,C.settings());
+    assert(rolling.some(m=>m.memo===`a${n-4}`));if(n>10)assert(!rolling.some(m=>m.memo==='a6'));
+    previous=out;
+  }
+  const tl15=await C.timeline(raw(15)),committed=C.commit(state,tl15.turns.slice(10,15),'세 번째 기록');
+  assert.equal(C.rawStart(committed,tl15,C.settings({rawTrim:'chunk'})),10);
+});
+test('raw boundaries reset safely after edits, restore and setting changes without dropping unprocessed turns',async()=>{
+  const {tl,state}=await stateWith(10,14),s=C.settings({rawTrim:'chunk'});
+  assert.equal(C.rawStart(state,tl,s),5);
+  const edited=structuredClone(state);edited.entries[0].text='수동 편집';edited.revision++;
+  assert.equal(C.rawStart(edited,tl,s),5);
+  assert.equal(C.rawStart(state,tl,{...s,recent:10}),0);
+  const source=raw(14,true);source[1].data='과거 수정';const changed=await C.timeline(source),reconciled=C.reconcile(state,changed);
+  assert.equal(C.rawStart(reconciled,changed,s),0);
+  assert.equal(C.inject(messages(source),reconciled,changed,s).filter(m=>m.role==='assistant').length,14);
+  const old=C.commit(C.emptyState(),tl.turns.slice(0,5),'복원된 이전 기록');
+  assert.equal(C.rawStart(old,tl,s),0);
+});
+test('Risu cooperation ignores either raw-trim choice and missing expanded raw IDs never fabricate history',async()=>{
+  const {tl,state}=await stateWith(10,12),input=messages(raw(12,true));
+  assert.deepEqual(C.inject(input,state,tl,C.settings({mode:'risu',rawTrim:'chunk'})),C.inject(input,state,tl,C.settings({mode:'risu'})));
+  const warnings=[],missing=input.filter(m=>m.memo!=='a6');
+  const out=C.inject(missing,state,tl,C.settings({rawTrim:'chunk'}),w=>warnings.push(w));
+  assert.equal(warnings.length,1);assert(!out.some(m=>m.memo==='a6'));assert(out.some(m=>m.memo==='a1'));
+});
 test('reserved memory and recall markers escape only on output, preserving raw stored text',async()=>{
   const {tl,state}=await stateWith();
   state.entries[0].title='[RISU-CHRONICLE-MEMORY-V1]';

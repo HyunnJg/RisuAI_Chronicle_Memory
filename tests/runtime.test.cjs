@@ -30,6 +30,42 @@ test('plugin registers UI and main hook; auxiliary requests pass through',async(
   const h=await setup();assert.equal(h.registrations,2);
   const input=formatted(raw(10));assert.equal(await h.hooks.beforeRequest(input,'memory'),input);assert.equal(h.calls.length,0);
 });
+test('staircase advances at commits, survives reload and keeps extra raw after a failed next chunk',async()=>{
+  let n=0;const h=await setup({rawTrim:'chunk',batchesPerRequest:2},{onCall:async opts=>{
+    if(++n===3)return {type:'fail',result:'next chunk failed'};
+    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+  }});
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');assert.equal(C.covered(h.getState()),10);
+  const id=h.getState().entries[0].id;
+  for(let completed=11;completed<=15;completed++){
+    h.char.chats[0].message=raw(completed);
+    const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+    assert(out.some(m=>m.memo==='a6'));assert(!out.some(m=>m.memo==='a5'));
+  }
+  assert.equal(C.covered(h.getState()),10);assert.equal(h.getState().entries[0].id,id);
+  const resumed=await setup({}, {store:h.store});resumed.char.chats[0].message=raw(14);
+  const out=await resumed.hooks.beforeRequest(formatted(resumed.char.chats[0].message),'model');
+  assert(out.some(m=>m.memo==='a6'));assert.equal(resumed.calls.length,0);
+});
+test('staircase hybrid excludes chunks still retained as raw and searches them only after the boundary moves',async()=>{
+  const h=await setup({mode:'hybrid',rawTrim:'chunk',embeddingModel:''});
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model'); // First catch-up chunk T1–T5.
+  assert.equal(C.covered(h.getState()),5);assert.equal(h.getRecall().reason,'recent-raw');
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model'); // Commit T6–T10, raw starts at T6.
+  assert.equal(C.covered(h.getState()),10);assert.equal(h.getRecall().reason,'not-configured');
+  h.char.chats[0].message=raw(14);h.char.chats[0].message.at(-1).data='보상 약속을 확인한다.';
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.deepEqual(h.getRecall().selected.map(row=>row.from),[1]);
+  assert.equal(h.calls.length,2);
+});
+test('the module can select staircase independently while Risu cooperation still preserves native input',async()=>{
+  const h=await setup({batchesPerRequest:2});h.char.chats[0].scriptstate={$chronicle_raw_trim:'chunk'};
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');h.char.chats[0].message=raw(12);
+  const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');assert(out.some(m=>m.memo==='a6'));
+  h.char.chats[0].scriptstate.$chronicle_mode='risu';
+  const input=[{role:'system',content:'native memory',memo:'supaMemory'},{role:'assistant',content:'native raw',memo:'a12'}];
+  const paired=await h.hooks.beforeRequest(input,'model');assert.deepEqual(paired.filter(m=>m.memo!==C.MARK),input);
+});
 test('summary credentials from another origin or an unbound legacy key never reach a network request',async()=>{
   for(const value of ['legacy-key',P.bindCredential('server-a-key','https://server-a.example/v1')]){
     const h=await setup({provider:'external',endpoint:'https://server-b.example/v1',model:'mock'},

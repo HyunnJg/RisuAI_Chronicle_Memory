@@ -29,6 +29,8 @@ function onStart(id)
   end
   local mode = readSetting(id, "mode")
   setChatVar(id, "chronicle_mode", enabled ~= "1" and "inherit" or mode == "1" and "standalone" or mode == "2" and "hybrid" or mode == "3" and "risu" or "inherit")
+  local trim = readSetting(id, "trim")
+  setChatVar(id, "chronicle_raw_trim", enabled ~= "1" and "inherit" or trim == "1" and "rolling" or trim == "2" and "chunk" or "inherit")
   local scope = readSetting(id, "risu_scope")
   setChatVar(id, "chronicle_risu_scope", enabled ~= "1" and "inherit" or scope == "1" and "all" or scope == "2" and "recent" or scope == "3" and "none" or "inherit")
   local clean = readSetting(id, "clean")

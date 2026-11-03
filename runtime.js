@@ -226,7 +226,7 @@
           for(let i=0;i<batch.length;i++)index.entries[batch[i].entry.id]={signature,hash:batch[i].hash,vector:vectors[i]};
           dirty=true;
         }
-        const candidates=state.entries.filter(e=>e.from<=ctx.tl.turns.length-s.recent&&index.entries[e.id]?.signature===signature);
+        const candidates=state.entries.filter(e=>e.from<=C.rawStart(state,ctx.tl,s)&&index.entries[e.id]?.signature===signature);
         if(candidates.length&&query){
           const hash=await C.digest(query),cached=D.query(ctx.key);
           if(cached?.signature===signature&&cached.hash===hash&&R.validVector(cached.vector))vector=cached.vector;
@@ -254,7 +254,7 @@
     for(const entry of state.entries){
       let cached=index.entries[entry.id];
       if(cached&&cached.hash!==await C.digest(R.document(entry))){delete index.entries[entry.id];cached=null;dirty=true;}
-      if(entry.from<=ctx.tl.turns.length-s.recent)candidates.push({...entry,embedding:cached});
+      if(entry.from<=C.rawStart(state,ctx.tl,s))candidates.push({...entry,embedding:cached});
     }
     const ranked=R.rank(candidates,query,vector,signature,s.recallMinSimilarity),selected=R.select(ranked,s,C.entryText,C.chars);
     if(ranked.length&&!selected.selected.length)warnings.push('검색 결과가 재강조 글자 수보다 커서 추가하지 않았습니다. 범위를 늘리면 청크 전체를 넣습니다.');
@@ -302,7 +302,7 @@
     notify('백업 JSON을 준비했습니다. 저장 링크를 직접 누르거나 JSON 전체를 복사하세요. 실제 파일 저장 완료 여부는 브라우저에서 확인해야 합니다.');
   }
   function values() {
-    return C.settings({enabled:$('enabled').checked,interval:Number($('interval').value),recent:Number($('recent').value),
+    return C.settings({enabled:$('enabled').checked,interval:Number($('interval').value),recent:Number($('recent').value),rawTrim:$('rawTrim').value,
       charsPerTurn:Number($('charsPerTurn').value),maxOutputTokens:Number($('maxOutputTokens').value),
       risuCharsPerTurn:Number($('risuCharsPerTurn').value),risuLogScope:$('risuLogScope').value,risuRecentChunks:Number($('risuRecentChunks').value),
       provider:$('provider').value,mode:$('mode').value,endpoint:$('endpoint').value.trim(),model:$('model').value.trim(),
@@ -317,7 +317,7 @@
   }
   function modeControls(){
     const paired=$('mode').value==='risu';
-    $('localRawSettings').hidden=paired;$('localSummaryTarget').hidden=paired;$('risuSettings').hidden=!paired;
+    $('localRawSettings').hidden=paired;$('localRawTrim').hidden=paired;$('rawTrimHelp').hidden=paired;$('localSummaryTarget').hidden=paired;$('risuSettings').hidden=!paired;
     $('risuChunkCount').hidden=$('risuLogScope').value!=='recent';
   }
   function draftOrigin(embedding=false) {
@@ -457,9 +457,9 @@
       (stats?` 최근 요약 T${stats.from}~T${stats.to}: 입력 JSON ${stats.originalChars} → ${stats.sentChars}글자 · ${stats.seconds}초.`+
         (Number.isFinite(stats.summaryChars)?` 저장 본문 ${stats.summaryChars}글자 / 권장 목표 ${stats.summaryTargetChars}글자.`:''):'');
     if($('effectiveSettings')) {
-      const operation=cfg.mode==='risu'?`Risu 기억 병행 · 원문: Risu 관리 (최근 원문 수 미적용) · 자체 자동 검색 꺼짐 · 연대기 ${cfg.risuLogScope==='all'?'전체':cfg.risuLogScope==='recent'?`최근 ${cfg.risuRecentChunks}청크`:'기록만'}`:`${cfg.mode==='hybrid'?'자체 하이브리드':'단독'} · 최근 원문 ${cfg.recent}턴 + 미요약 구간 유지`;
+      const operation=cfg.mode==='risu'?`Risu 기억 병행 · 원문: Risu 관리 (최근 원문 수·자르기 방식 미적용) · 자체 자동 검색 꺼짐 · 연대기 ${cfg.risuLogScope==='all'?'전체':cfg.risuLogScope==='recent'?`최근 ${cfg.risuRecentChunks}청크`:'기록만'}`:`${cfg.mode==='hybrid'?'자체 하이브리드':'단독'} · 원문 기본 ${cfg.recent}턴 · ${cfg.rawTrim==='chunk'?'청크 커밋 시 이동 (계단식)':'매 턴 이동'} · 정책상 완료 원문 ${ctx.tl.turns.length-C.rawStart(state,ctx.tl,cfg)}턴 유지 (미처리 포함)`;
       const overrides=Object.entries(C.CHAT_KEYS).filter(([key])=>cfg[key]!==globalSettings[key]).map(([key])=>key);
-      $('effectiveSettings').textContent=(overrides.length?`채팅 변수 적용: ${overrides.map(key=>({enabled:'기억 사용',interval:'요약 주기',recent:'최근 원문',charsPerTurn:'요약 목표',maxOutputTokens:'응답 상한',batchesPerRequest:'요청당 묶음',mode:'처리 방식',cleanSummaryInput:'입력 정리',risuCharsPerTurn:'병행 요약 목표',risuLogScope:'병행 주입 범위',risuRecentChunks:'병행 청크 수'})[key]||key).join(', ')} · 카드/모듈에서 지정할 수 있습니다.\n`:'플러그인 기본값과 같은 동작입니다.\n')+`현재 대화 적용값: ${cfg.enabled?'사용':'중지'} · ${cfg.interval}턴마다 · ${operation}`+
+      $('effectiveSettings').textContent=(overrides.length?`채팅 변수 적용: ${overrides.map(key=>({enabled:'기억 사용',interval:'요약 주기',recent:'최근 원문',rawTrim:'원문 자르기 방식',charsPerTurn:'요약 목표',maxOutputTokens:'응답 상한',batchesPerRequest:'요청당 묶음',mode:'처리 방식',cleanSummaryInput:'입력 정리',risuCharsPerTurn:'병행 요약 목표',risuLogScope:'병행 주입 범위',risuRecentChunks:'병행 청크 수'})[key]||key).join(', ')} · 카드/모듈에서 지정할 수 있습니다.\n`:'플러그인 기본값과 같은 동작입니다.\n')+`현재 대화 적용값: ${cfg.enabled?'사용':'중지'} · ${cfg.interval}턴마다 · ${operation}`+
         ` · 청크 본문 권장 목표 ${C.summaryTarget(cfg,cfg.interval)}글자 (초과해도 수용) · 응답 ${cfg.maxOutputTokens}토큰 상한/목표 · 입력 정리 ${cfg.cleanSummaryInput?'사용':'해제'}`;
       $('diagnostics').textContent=[...new Set([cfg.configWarning||'',...cfg.settingWarnings,...(state.summaryWarnings||[]),state.lastWarning||''])].filter(Boolean).join('\n') || '설정·원문 확인 경고 없음';
     }
@@ -554,10 +554,10 @@
       .downloadLink{display:inline-block;min-height:44px;padding:10px 15px;background:#a8dfcb;color:#10221c;border-radius:6px;font-weight:700;text-decoration:underline}
       input,select,textarea{font-size:16px;min-width:0}button{min-height:44px}header>div{min-width:0}main,section{overflow-wrap:anywhere}
       @media(max-width:600px){main{padding:12px}section{padding:14px}header{flex-wrap:wrap;align-items:flex-start}h1{font-size:22px}.grid{grid-template-columns:minmax(0,1fr)}.row>button{max-width:100%}}`+'</style>';
-    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.6</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
+    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.7</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
       <section><h2>실행 환경 · 최근 기억 처리</h2><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>중단하면 늦은 응답을 기록에 반영하지 않고 미요약 원문을 유지합니다. 서버 호출·과금 취소는 보장하지 않습니다. 이전 호출이 끝나기 전에는 같은 채팅에서 새 기억 호출을 시작하지 않습니다. 대기 중에도 이 설정창은 열 수 있습니다. 설정 저장·기록 수정·삭제는 진행 중인 작업이 끝난 뒤 처리하므로 필요하면 기다리기를 먼저 중단하세요.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다. Risu 저장소는 실제 디스크 반영이 지연될 수 있어 기록 완료 직후 앱을 강제 종료하면 최근 기록이 남지 않을 수 있습니다.</p><p>API 요청은 Risu의 네트워크 설정을 따릅니다. 웹 환경에서 프록시를 사용하면 요청 내용과 인증정보가 해당 프록시를 경유할 수 있습니다. 연결 오류는 Risu의 직접 호출·프록시 설정도 확인하세요.</p></details></section>
       <section><h2>이 기억은 어떻게 동작하나요?</h2><p>대화 원문을 설정한 턴 수만큼 묶어 짧은 사건 기록으로 바꾸고, 이전 사건 기록 전체와 최근 원문을 다음 RP 요청에 함께 보냅니다. 오래된 로그를 반복해서 다시 요약하지 않습니다.</p>
-      <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다.</p>
+      <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다. <strong>원문 자르기 → 청크 커밋 시 이동</strong>을 선택하면 같은 조건에서 원문 T6~T12를 유지하고, 다음 T11~T15 청크가 저장되면 원문 T11~T15로 이동합니다.</p>
       <p><strong>Risu 기억 병행 · 하이파 주력</strong>은 원문 관리와 과거 검색을 Risu에 맡기고, 같은 주기로 만든 짧은 연대기를 덧붙입니다. 기본은 턴당 50글자 목표·누적 로그 전체 주입이며 최근 K청크·기록만도 선택할 수 있습니다. 기존 단독·자체 하이브리드 설정은 그대로 유지합니다.</p>
       <p><strong>단독</strong>은 위 구성을 사용합니다. <strong>하이브리드</strong>는 여기에 현재 대화와 관련된 요약 청크를 골라 최근 입력 가까이에 다시 보여줍니다. 오래된 원문은 검색하거나 다시 넣지 않습니다. 임베딩은 모델 내부 어텐션을 직접 조절하지 않습니다.</p>
       <p>청크 예: <strong>다음 만남의 약속 (1–5턴)</strong><br>다음 날 저녁 — 두 사람이 서점 앞에서 다시 만나기로 함.<br>요약 모델은 새 구간 전체만 읽고, 턴마다 따로 나누지 않고 사건별로 묶습니다. 시점은 원문에서 확인한 표현만 기록하며 없으면 생략합니다.</p>
@@ -585,12 +585,13 @@
       <section><h2>플러그인 기본값 · 모듈에서 상속할 동작</h2><label><input id="enabled" type="checkbox"> 플러그인 기본값으로 기억 사용</label>
       <div class="grid"><label>요약 주기 (완료 턴)<input id="interval" type="number" min="5" max="20"></label>
       <label id="localRawSettings">유지할 최근 원문 (단독·자체 하이브리드)<input id="recent" type="number" min="5" max="20"></label>
+      <label id="localRawTrim">원문 자르기 방식<select id="rawTrim"><option value="rolling">매 턴 이동 (기본)</option><option value="chunk">청크 커밋 시 이동 (계단식)</option></select></label>
       <label id="localSummaryTarget">턴당 평균 요약 목표 (단독·자체 하이브리드)<input id="charsPerTurn" type="number" min="50" max="200"></label>
       <label>구간 응답 토큰 상한/목표<input id="maxOutputTokens" type="number" min="128" max="8192"></label>
       <label>원문 처리<select id="mode"><option value="standalone">단독 · 누적 로그 + 최근 원문</option><option value="hybrid">자체 하이브리드 · 단독 + 청크 검색</option><option value="risu">Risu 기억 병행 · 하이파 주력</option></select></label>
       <label>요청당 최대 요약 묶음<input id="batchesPerRequest" type="number" min="1" max="20"></label>
       </div>
-      <div id="risuSettings" hidden><h3>Risu 기억 병행 전용</h3><div class="grid">
+      <p id="rawTrimHelp">매 턴 이동은 최근 N턴을 매번 유지합니다. 계단식은 마지막 요약 완료 지점에서 N턴을 남기고 새 원문을 덧붙이다가 다음 청크 저장 시 한 번에 자릅니다. 주기 5·최근 원문 5라면 정상 진행 중 5~9턴(평균 약 7턴)이 남습니다. 실패·중단·따라잡기 중에는 더 남습니다. 평균 입력이 늘지만 원문 앞부분이 유지돼 캐시 활용에 유리할 수 있습니다. 실제 적중·비용 절감은 제공자와 Risu의 프롬프트·캐시 설정에 따라 달라집니다. 설정 변경·원문 수정·백업 복원 시에는 범위를 다시 계산합니다.</p><div id="risuSettings" hidden><h3>Risu 기억 병행 전용</h3><div class="grid">
       <label>병행 턴당 요약 목표 (10~200글자)<input id="risuCharsPerTurn" type="number" min="10" max="200"></label>
       <label>병행 연대기 주입<select id="risuLogScope"><option value="all">누적 로그 전체 (기본)</option><option value="recent">최근 K청크</option><option value="none">기록만 · 주입 안 함</option></select></label>
       <label id="risuChunkCount">최근 청크 수 K<input id="risuRecentChunks" type="number" min="1" max="100"></label></div>

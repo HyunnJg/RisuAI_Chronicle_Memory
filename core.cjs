@@ -3,7 +3,7 @@
 /* Original implementation. No third-party implementation code is included. */
 const ChronicleCore = (() => {
   'use strict';
-  const DEFAULTS = Object.freeze({ enabled: false, interval: 5, recent: 5,
+  const DEFAULTS = Object.freeze({ enabled: false, interval: 5, recent: 5, rawTrim:'rolling',
     charsPerTurn: 100, maxOutputTokens: 500, provider: 'submodel', mode: 'standalone',
     endpoint: '', model: '', tokenField: 'max_tokens',
     batchesPerRequest: 1, customPrompt: '', project: '', location: 'global', publisher: 'google',
@@ -25,6 +25,7 @@ const ChronicleCore = (() => {
     if (!['submodel','memory','main','external','openai','gemini','anthropic','vertex'].includes(s.provider)) throw Error('잘못된 요약 모델 설정');
     if(s.mode==='append'){s.mode='hybrid';s.legacyAppendMigrated=true;}
     if (!['standalone','hybrid','risu'].includes(s.mode)) throw Error('잘못된 주입 모드');
+    if (!['rolling','chunk'].includes(s.rawTrim)) throw Error('원문 자르기는 매 턴 이동 또는 청크 커밋 시 이동을 선택하세요.');
     if(!['all','recent','none'].includes(s.risuLogScope))throw Error('잘못된 Risu 병행 연대기 주입 범위');
     if(!['openai','gemini','vertex','external','voyage'].includes(s.embeddingProvider))throw Error('임베딩 제공자를 선택하세요.');
     if(!['predict','embedContent'].includes(s.embeddingVertexMethod))throw Error('Vertex 임베딩 호출 형식을 확인하세요.');
@@ -38,7 +39,7 @@ const ChronicleCore = (() => {
     if (!['google','anthropic'].includes(s.publisher)) throw Error('Vertex publisher 설정 오류');
     return s;
   }
-  const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks'};
+  const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',rawTrim:'chronicle_raw_trim',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks'};
   function chatSettings(s,chat) {
     let resolved=settings(s); const warnings=[];
     for(const [setting,key] of Object.entries(CHAT_KEYS)) {
@@ -49,7 +50,7 @@ const ChronicleCore = (() => {
         if(setting==='enabled'||setting==='cleanSummaryInput') {
           if(!['0','1','true','false'].includes(String(value))) throw Error('채팅 기억 활성 설정 오류');
           parsed=['1','true'].includes(String(value));
-        } else parsed=['mode','risuLogScope'].includes(setting)?String(value):Number(value);
+        } else parsed=['mode','risuLogScope','rawTrim'].includes(setting)?String(value):Number(value);
         resolved=settings({...resolved,[setting]:parsed});
       } catch {
         warnings.push(`${key}: 잘못된 채팅 설정 대신 플러그인 기본값 ${s[setting] ?? DEFAULTS[setting]} 사용`);
@@ -334,14 +335,21 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
   }
   const escapeMarkers=text=>String(text).replace(/\[(\/?risu-chronicle-(?:memory|recall)-v1)\]/gi,'［$1］');
   function entryText(e){return escapeMarkers(`${e.title||'사건 기록'} (${e.from}–${e.to}턴)\n${e.text}`);}
+  function rawStart(state,tl,s) {
+    const end=Math.min(covered(state),tl.turns.length);
+    // A committed chunk advances the staircase; failures never advance it.
+    // Risu cooperation never uses this boundary to trim the host's messages.
+    const anchor=s.rawTrim==='chunk'&&s.mode!=='risu'?end:tl.turns.length;
+    return Math.max(0,Math.min(anchor-s.recent,end));
+  }
   function inject(messages,state,tl,s,onWarning=()=>{},recall='') {
     const text=memoryText(state,s);
     // Only remove our own memo-tagged injected message on provider retries.
     let out=messages.filter(m=>m.memo!==MARK && m.memo!==MARK+'-recall');
     if(['standalone','hybrid'].includes(s.mode)) {
-      const keepFrom=Math.max(0,tl.turns.length-s.recent), end=covered(state);
-      const removeIDs=new Set(tl.turns.slice(0,Math.min(keepFrom,end)).flatMap(t=>t.messages.map(m=>m.chatId)).filter(Boolean));
-      const required=tl.turns.slice(Math.min(keepFrom,end)).flatMap(t=>t.messages).concat(tl.pending);
+      const keepFrom=rawStart(state,tl,s);
+      const removeIDs=new Set(tl.turns.slice(0,keepFrom).flatMap(t=>t.messages.map(m=>m.chatId)).filter(Boolean));
+      const required=tl.turns.slice(keepFrom).flatMap(t=>t.messages).concat(tl.pending);
       const present=new Set(out.filter(m=>m.content?.trim()).map(m=>m.memo));
       if(required.some(m=>!m.chatId || !present.has(m.chatId))) onWarning('최근/미요약 원문의 ID를 요청에서 확인하지 못해 이번 요청은 원문을 자르지 않고 로그만 추가했습니다. Risu가 이미 제외한 원문은 복원하지 못합니다. 기본 기억·컨텍스트·프리셋을 확인하세요.');
       else out=out.filter(m=>!removeIDs.has(m.memo));
@@ -361,6 +369,6 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,inject,MARK };
+    summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;

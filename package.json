@@ -1,6 +1,6 @@
 {
   "name": "risu-chronicle-memory",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "private": true,
   "description": "Append-only chronological memory plugin for RisuAI API 3.0",
   "scripts": {

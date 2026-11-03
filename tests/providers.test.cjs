@@ -137,6 +137,8 @@ test('built risum contains native settings and captions with no display injectio
   assert.equal(obj.module.regex.length,0);assert.match(obj.module.customModuleToggle,/chronicle_ctl_interval=.*=text/);
   assert.match(obj.module.customModuleToggle,/캐시|캐시는/);assert.match(obj.module.customModuleToggle,/=caption/);
   assert.match(obj.module.customModuleToggle,/Risu 기억 병행/);assert.match(obj.module.customModuleToggle,/chronicle_ctl_risu_scope=.*=select/);assert.match(obj.module.customModuleToggle,/모듈설정 사용/);
+  assert.match(obj.module.customModuleToggle,/chronicle_ctl_trim=.*=select=플러그인 기본값,매 턴 이동,청크 커밋 시 이동/);
+  assert.match(obj.module.trigger[0].effect[0].code,/chronicle_raw_trim/);assert.match(obj.module.trigger[0].effect[0].code,/trim == "2" and "chunk"/);
   assert(!obj.module.customModuleToggle.includes('chronicle_ctl_timeout='));assert(!obj.module.customModuleToggle.includes('chronicle_ctl_budget='));assert.match(obj.module.customModuleToggle,/chronicle_ctl_clean=.*=select/);
   assert.equal(obj.module.trigger[0].type,'start');assert.match(obj.module.trigger[0].effect[0].code,/getGlobalVar/);
   assert.match(obj.module.trigger[0].effect[0].code,/setChatVar/);assert(!obj.module.trigger[0].effect[0].code.includes('nativeFetch'));

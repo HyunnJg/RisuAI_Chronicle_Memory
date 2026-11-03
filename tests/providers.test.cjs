@@ -4,6 +4,29 @@ const {test}=require('node:test');const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 const P=require('../providers.cjs'),C=require('../core.cjs');
 const messages=[{role:'system',content:'기록자'},{role:'user',content:'기록 대상'}];
+test('external credentials bind to validated origins and reject legacy or changed origins',()=>{
+  const bound=P.bindCredential('synthetic-key','https://a.example/v1');
+  assert.equal(P.credentialSecret(bound,'https://a.example/other/v1'),'synthetic-key');
+  for(const url of ['https://b.example/v1','https://a.example:8443/v1','http://localhost:8080'])assert.throws(()=>P.credentialSecret(bound,url),/주소/);
+  assert.throws(()=>P.credentialSecret('legacy-key','https://a.example/v1'),/연결 주소/);
+  assert.equal(P.credentialSecret(null,'https://a.example/v1'),'');
+  assert.throws(()=>P.bindCredential('key','https://a.example/v1?key=forbidden'));
+  assert.throws(()=>P.credentialRecord('{"format":"chronicle-origin-credential-v1","secret":"x","origin":"https://a.example/path"}'));
+});
+test('dedicated embedding keys use the same origin rule including ports and schemes',()=>{
+  const bound=P.bindCredential('embedding-key','http://localhost:8080/v1/embeddings',true);
+  assert.equal(P.credentialSecret(bound,'http://localhost:8080/embeddings',true),'embedding-key');
+  assert.throws(()=>P.credentialSecret(bound,'http://localhost:9090/v1',true),/주소/);
+  assert.throws(()=>P.credentialSecret(bound,'https://localhost:8080/v1',true),/주소/);
+});
+test('error fallback masks Voyage, Groq and xAI keys while exact custom secrets are masked too',()=>{
+  for(const prefix of ['pa-','gsk_','xai-'])assert(!P.safeError('echo '+prefix+'x'.repeat(24)).includes(prefix));
+  assert(!P.safeError('echo custom-secret',['custom-secret']).includes('custom-secret'));
+});
+test('local HTTP failures explain host routing and browser permissions without exposing keys',async()=>{
+  const cfg={...config('external'),endpoint:'http://localhost:8080/v1'};
+  await assert.rejects(()=>P.complete({nativeFetch:async()=>{throw Error('echo custom-test-secret');}},cfg,'custom-test-secret',messages),e=>e.message.includes('로컬 네트워크')&&!e.message.includes('custom-test-secret'));
+});
 const config=provider=>C.settings({provider,model:provider==='anthropic'?'claude-test':'gemini-3.8-flash',...P.defaults(provider),...(provider==='external'?{endpoint:'https://example.org/v1',model:'openai/test-model'}:{model:provider==='anthropic'?'claude-test':'gemini-3.8-flash'})});
 function transport(responses) {
   const calls=[];

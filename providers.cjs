@@ -13,7 +13,29 @@ const ChronicleProviders=(()=>{
     for(const secret of secrets.filter(x=>typeof x==='string'&&x.length>3)) text=text.split(secret).join('[숨김]');
     return text.replace(/-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?-----END[^-]*PRIVATE KEY-----/g,'[개인키 숨김]')
       .replace(/(Bearer\s+|(?:api[_-]?key|access_token|assertion)["'\s:=]+)[^\s"'&,}]+/gi,'$1[숨김]')
-      .replace(/\b(?:AIza[\w-]{12,}|sk-[\w-]{12,}|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b/g,'[키/토큰 숨김]').slice(0,900);
+      .replace(/\b(?:AIza[\w-]{12,}|sk-[\w-]{12,}|pa-[\w-]{12,}|gsk_[\w-]{12,}|xai-[\w-]{12,}|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b/g,'[키/토큰 숨김]').slice(0,900);
+  }
+  const CREDENTIAL_FORMAT='chronicle-origin-credential-v1';
+  function credentialRecord(value) {
+    if(!value)return {secret:'',origin:null};
+    let parsed;try{parsed=typeof value==='string'?JSON.parse(value):value;}catch{}
+    if(parsed?.format===CREDENTIAL_FORMAT){
+      if(typeof parsed.secret!=='string'||typeof parsed.origin!=='string'||new URL(parsed.origin).origin!==parsed.origin)throw Error('저장된 주소별 인증정보 형식을 확인하세요. 키를 다시 입력하세요.');
+      return {secret:parsed.secret,origin:parsed.origin};
+    }
+    if(typeof value!=='string')throw Error('저장된 인증정보 형식이 올바르지 않습니다.');
+    return {secret:value,origin:null};
+  }
+  function credentialOrigin(endpoint,embedding=false){return new URL(embedding?embeddingURL(endpoint):compatibleURL(endpoint)).origin;}
+  function bindCredential(secret,endpoint,embedding=false) {
+    if(typeof secret!=='string')throw Error('API 키는 문자열이어야 합니다.');
+    return JSON.stringify({format:CREDENTIAL_FORMAT,secret,origin:credentialOrigin(endpoint,embedding)});
+  }
+  function credentialSecret(value,endpoint,embedding=false) {
+    const record=credentialRecord(value);if(!record.secret)return '';
+    if(!record.origin)throw Error('기존 직접 입력 키에 연결 주소가 없습니다. 설정창에서 주소를 확인한 뒤 ‘현재 주소에 이 키 연결’을 누르고 저장하세요.');
+    if(record.origin!==credentialOrigin(endpoint,embedding))throw Error('저장된 키의 서버 주소와 현재 주소가 달라 전송을 차단했습니다. 새 키를 입력하거나 주소를 확인한 뒤 ‘현재 주소에 이 키 연결’을 누르고 저장하세요.');
+    return record.secret;
   }
   function defaults(provider) {
     return {endpoint:provider==='openai'?'https://api.openai.com/v1/chat/completions':provider==='gemini'?'https://generativelanguage.googleapis.com/v1beta':provider==='anthropic'?'https://api.anthropic.com/v1/messages':'',
@@ -52,7 +74,10 @@ const ChronicleProviders=(()=>{
   }
   async function request(api,url,options,secrets=[]) {
     let response;
-    try{response=await api.nativeFetch(url,options);}catch(e){throw Error('API 통신 실패: '+safeError(e,secrets));}
+    try{response=await api.nativeFetch(url,options);}catch(e){
+      let hint='';try{const target=new URL(url);if(target.protocol==='http:'&&['localhost','127.0.0.1','[::1]'].includes(target.hostname))hint=' 웹·모바일에서는 localhost가 접속 기기 또는 프록시 서버를 가리킬 수 있습니다. Risu 호출 경로, 브라우저 로컬 네트워크 권한과 CORS를 확인하세요.';}catch{}
+      throw Error('API 통신 실패: '+safeError(e,secrets)+hint);
+    }
     let body;
     try{const text=await response.text();try{body=JSON.parse(text);}catch{body={error:{message:text.slice(0,500)}};}}
     catch(e){throw Error('API 응답 읽기 실패: '+safeError(e,secrets));}
@@ -284,7 +309,7 @@ const ChronicleProviders=(()=>{
     if(!result.length)throw Error('조회된 임베딩 모델이 없습니다. 지원되는 모델 ID를 직접 입력할 수 있습니다.');
     return [...new Map(result.map(m=>[m.id,m])).values()].sort((a,b)=>a.id.localeCompare(b.id));
   }
-  return {NATIVE,LABELS,defaults,compatibleURL,safeError,serviceAccount,vertexToken,googleBody,claudeBody,nativeText,complete,models,
+  return {NATIVE,LABELS,defaults,compatibleURL,safeError,credentialRecord,credentialOrigin,bindCredential,credentialSecret,serviceAccount,vertexToken,googleBody,claudeBody,nativeText,complete,models,
     embeddingURL,isVoyageURL,isVoyageEmbedding,canReuseExternalCredential,VOYAGE_MODELS,checkVectors,embeddingGoogleBody,embed,embeddingModels};
 })();
 if(typeof module!=='undefined'&&module.exports)module.exports=ChronicleProviders;

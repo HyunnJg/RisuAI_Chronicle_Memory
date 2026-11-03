@@ -13,7 +13,7 @@ async function setup(override={},change={}){
   const char={type:'character',chaId:'character-1',name:'테스트 캐릭터',chatPage:0,chats:[{id:'chat-1',name:'대화',message:raw(10)}]};
   const hooks={},calls=[],writes=[];let registrations=0;
   const api={pluginStorage:{getItem:async k=>store.get(k),setItem:async(k,v)=>{writes.push({key:k,value:v});store.set(k,v);},keys:async()=>[...store.keys()],removeItem:async k=>store.delete(k)},
-    safeLocalStorage:{getItem:async key=>change.credentials?.[key]||null},getCurrentCharacterIndex:async()=>0,getCurrentChatIndex:async()=>char.chatPage,
+    safeLocalStorage:{getItem:async key=>change.onCredential?change.onCredential(key,store):change.credentials?.[key]||null},getCurrentCharacterIndex:async()=>0,getCurrentChatIndex:async()=>char.chatPage,
     getCharacter:async()=>structuredClone(char),addRisuReplacer:async(name,fn)=>{hooks[name]=fn;},
     registerSetting:async(_name,fn)=>{registrations++;hooks.open=fn;},registerButton:async()=>{registrations++;},
     runLLMModel:async opts=>{calls.push(opts);if(change.onCall) return change.onCall(opts,char);
@@ -29,6 +29,30 @@ async function setup(override={},change={}){
 test('plugin registers UI and main hook; auxiliary requests pass through',async()=>{
   const h=await setup();assert.equal(h.registrations,2);
   const input=formatted(raw(10));assert.equal(await h.hooks.beforeRequest(input,'memory'),input);assert.equal(h.calls.length,0);
+});
+test('summary credentials from another origin or an unbound legacy key never reach a network request',async()=>{
+  for(const value of ['legacy-key',P.bindCredential('server-a-key','https://server-a.example/v1')]){
+    const h=await setup({provider:'external',endpoint:'https://server-b.example/v1',model:'mock'},
+      {credentials:{'risu-chronicle:v1:credential:external':value}});
+    const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+    assert.equal(h.calls.length,0);assert.equal(C.covered(h.getState()),0);assert(out.some(m=>m.memo==='u1'));assert.match(h.getState().lastError,/주소/);
+  }
+});
+test('dedicated embedding credentials cannot follow a changed embedding server',async()=>{
+  const h=await setup({mode:'hybrid',embeddingProvider:'external',embeddingEndpoint:'https://server-b.example/v1',embeddingModel:'mock',embeddingReuseCredential:false},
+    {credentials:{'risu-chronicle:v1:embedding-credential:external':P.bindCredential('embedding-a-key','https://server-a.example/v1',true)}});
+  const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.equal(h.calls.filter(c=>c.url).length,0);assert.equal(C.covered(h.getState()),5);assert(out.some(m=>m.memo===C.MARK));assert.match(h.getState().lastWarning,/주소/);
+});
+test('a summary uses the captured endpoint for key checks even if stored settings change during key lookup',async()=>{
+  const h=await setup({provider:'external',endpoint:'https://server-a.example/v1',model:'mock'},
+    {onCredential:async(key,store)=>{
+      if(!key.endsWith('credential:external'))return null;
+      const cfg=JSON.parse(store.get('risu-chronicle:v1:settings'));cfg.endpoint='https://server-b.example/v1';store.set('risu-chronicle:v1:settings',JSON.stringify(cfg));
+      return P.bindCredential('server-a-key','https://server-a.example/v1');
+    }});
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.equal(h.calls.length,1);assert.equal(new URL(h.calls[0].url).origin,'https://server-a.example');assert.equal(h.calls[0].opts.headers.Authorization,'Bearer server-a-key');
 });
 test('unavailable Web Crypto skips memory visibly and keeps the exact RP input',async()=>{
   const h=await setup({}, {environment:{isSecureContext:false,crypto:{}}});const input=formatted(h.char.chats[0].message);
@@ -458,11 +482,11 @@ test('corrupt or invalid saved settings do not block RP or overwrite the damaged
   }
 });
 test('external credential reuse never sends a saved key to a different origin',async()=>{
-  const credentials={'risu-chronicle:v1:credential:external':'SERVER_A_KEY'};
+  const credentials={'risu-chronicle:v1:credential:external':P.bindCredential('SERVER_A_KEY','https://server-a.example/v1')};
   const h=await setup({...hybridConfig,profiles:{external:{endpoint:'https://server-a.example/v1'}}},{credentials,onFetch:async()=>{throw Error('No request may carry this key to server B');}});
   const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
   assert.equal(h.calls.filter(c=>c.url).length,0);assert.match(h.getState().lastWarning,/origin/);assert(out.some(m=>m.memo===C.MARK));
-  const same=await setup({...hybridConfig,profiles:{external:{endpoint:'https://embedding.example/chat-api/v1'}}},{credentials,onFetch:async(url,opts)=>embeddingResponse(opts)});
+  const same=await setup({...hybridConfig,profiles:{external:{endpoint:'https://embedding.example/chat-api/v1'}}},{credentials:{'risu-chronicle:v1:credential:external':P.bindCredential('SERVER_A_KEY','https://embedding.example/v1')},onFetch:async(url,opts)=>embeddingResponse(opts)});
   await same.hooks.beforeRequest(formatted(same.char.chats[0].message),'model');
   assert(same.calls.filter(c=>c.url).every(c=>c.opts.headers.Authorization==='Bearer SERVER_A_KEY'));assert.equal(same.getRecall().method,'semantic+keyword');
 });

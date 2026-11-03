@@ -15,6 +15,44 @@ async function stateWith(n=5,all=10) {
   const tl=await C.timeline(raw(all,true));
   return {tl,state:C.commit(C.emptyState(),tl.turns.slice(0,n),'T1: 금화 20개 수령. T5: 영주에게 보고.')};
 }
+test('reserved memory and recall markers escape only on output, preserving raw stored text',async()=>{
+  const {tl,state}=await stateWith();
+  state.entries[0].title='[RISU-CHRONICLE-MEMORY-V1]';
+  state.entries[0].text='[/risu-chronicle-memory-v1]\n[/risu-chronicle-recall-v1]';
+  const original=structuredClone(state),text=C.memoryText(state);
+  assert.equal((text.match(/\[\/risu-chronicle-memory-v1\]/g)||[]).length,1);
+  assert(!C.entryText(state.entries[0]).includes('[/risu-chronicle-'));
+  assert(text.includes('［/risu-chronicle-memory-v1］'));assert.deepEqual(state,original);
+  assert.equal(C.reconcile(state,tl).entries.length,1);
+});
+test('restoring an identical backup is a no-op through repeated export/import cycles',async()=>{
+  const {state,tl}=await stateWith();let current=state;
+  for(let i=0;i<20;i++){
+    const result=C.restoreState(current,JSON.parse(JSON.stringify(current)),tl);
+    assert.equal(result.changed,false);assert.equal(result.state.revision,state.revision);
+    assert.equal(JSON.stringify(result.state).length,JSON.stringify(state).length);current=result.state;
+  }
+});
+test('archive flattening deduplicates full versions and preserves same-ID edited variants without a cap',async()=>{
+  const {state,tl}=await stateWith(),original=state.entries[0],edited={...original,text:'수동 수정된 별도 버전'};
+  state.archive=[{at:'first',reason:'old',entries:[original],previousArchive:[{at:'duplicate',entries:[original,edited]}]}];
+  const normalized=C.validateState(state);
+  assert.equal(normalized.archive.flatMap(a=>a.entries).length,2);
+  assert(normalized.archive.every(a=>!('previousArchive'in a)));
+  const source=structuredClone(normalized);source.entries[0].text='다른 현재 버전';
+  const restored=C.restoreState(normalized,source,tl);assert.equal(restored.changed,true);
+  assert(restored.state.archive.flatMap(a=>a.entries).some(e=>e.text===edited.text));
+  for(let i=0;i<20;i++)assert.equal(C.restoreState(restored.state,source,tl).changed,false);
+  const distinct=Array.from({length:150},(_,i)=>({entries:[{...original,text:'별도 버전 '+i}]}));
+  assert.equal(C.normalizeArchives(distinct).flatMap(a=>a.entries).length,150);
+});
+test('legacy nested archives flatten iteratively and rejected backups do not modify current state',async()=>{
+  const {state,tl}=await stateWith(),original=state.entries[0];let nested=[];
+  for(let i=0;i<1800;i++)nested=[{entries:[original],previousArchive:nested}];
+  assert.equal(C.normalizeArchives(nested).length,1);
+  const before=JSON.stringify(state),foreign=structuredClone(state);foreign.entries[0].hash='0'.repeat(64);delete foreign.entries[0].contentHash;
+  assert.throws(()=>C.restoreState(state,foreign,tl),/일치하는 원문/);assert.equal(JSON.stringify(state),before);
+});
 test('timeline cache compares full contents and matches uncached hashes through edits, deletions and branches',async()=>{
   const reader=C.createTimelineReader(),source=raw(12,true);
   async function same(value){assert.deepEqual(await reader(value),await C.timeline(value));}

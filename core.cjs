@@ -70,7 +70,13 @@ const ChronicleCore = (() => {
     return raw.slice(start).filter(m => m.disabled !== true && !m.isComment &&
       ['user','char','assistant'].includes(m.role) && typeof m.data === 'string' && m.data.trim());
   }
-  async function timeline(raw) {
+  const sourceText = raw => JSON.stringify(activeMessages(raw).map(m=>[m.role,m.data,m.chatId || '',m.saying || '']));
+  // Only reuse hashes after comparing every relevant value of every preceding turn.
+  // The cache is one in-memory snapshot, never an ID/length shortcut or saved state.
+  function createTimelineReader() {
+    const cache={turns:[]};return raw=>timeline(raw,cache);
+  }
+  async function timeline(raw,cache=null) {
     const active = activeMessages(raw), turns = [], pending = [];
     let current = null, prelude = [];
     const flush = () => {
@@ -99,15 +105,21 @@ const ChronicleCore = (() => {
     flush();
     // Greeting-only history is context, not a completed user/AI turn.
     pending.unshift(...prelude);
-    let chain='chronicle-v1', contentChain='chronicle-content-v1';
+    let chain='chronicle-v1', contentChain='chronicle-content-v1',reusable=true;
+    const previous=cache?.turns||[],next=[];
     for (let i=0;i<turns.length;i++) {
       const t=turns[i]; t.number=i+1;
-      chain=await digest([chain,t.messages.map(m=>[m.role,m.data,m.chatId || '',m.saying || ''])]);
+      const values=t.messages.map(m=>[m.role,m.data,m.chatId || '',m.saying || '']),source=JSON.stringify(values);
+      reusable=reusable&&previous[i]?.source===source;
+      chain=reusable?previous[i].hash:await digest([chain,values]);
       t.hash=chain;
-      contentChain=await digest([contentChain,t.messages.map(m=>[m.role==='user'?'user':'assistant',m.data,m.saying || ''])]);
+      contentChain=reusable?previous[i].contentHash:await digest([contentChain,t.messages.map(m=>[m.role==='user'?'user':'assistant',m.data,m.saying || ''])]);
       t.contentHash=contentChain;
+      next.push({source,hash:chain,contentHash:contentChain});
     }
-    return { turns, pending, active, fingerprint: await digest(active.map(m=>[m.role,m.data,m.chatId || '',m.saying || ''])) };
+    const source=sourceText(raw),fingerprint=await digest(source);
+    if(cache)cache.turns=next;
+    return { turns, pending, active, fingerprint,sourceText:source };
   }
   function emptyState() { return { schema:1, revision:0, entries:[], archive:[], lastError:'' }; }
   function validateState(value) {
@@ -311,7 +323,7 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     }
     return out;
   }
-  return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,timeline,emptyState,validateState,reconcile,covered,nextBatch,
+  return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,reconcile,covered,nextBatch,
     summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;

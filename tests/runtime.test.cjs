@@ -15,13 +15,14 @@ async function setup(override={},change={}){
   const api={pluginStorage:{getItem:async k=>store.get(k),setItem:async(k,v)=>{writes.push({key:k,value:v});store.set(k,v);},keys:async()=>[...store.keys()],removeItem:async k=>store.delete(k)},
     safeLocalStorage:{getItem:async key=>change.credentials?.[key]||null},getCurrentCharacterIndex:async()=>0,getCurrentChatIndex:async()=>char.chatPage,
     getCharacter:async()=>structuredClone(char),addRisuReplacer:async(name,fn)=>{hooks[name]=fn;},
-    registerSetting:async()=>{registrations++;},registerButton:async()=>{registrations++;},
+    registerSetting:async(_name,fn)=>{registrations++;hooks.open=fn;},registerButton:async()=>{registrations++;},
     runLLMModel:async opts=>{calls.push(opts);if(change.onCall) return change.onCall(opts,char);
       const data=JSON.parse(opts.messages[1].content);return {type:'success',result:JSON.stringify(chunk(data))};},
     nativeFetch:async(url,opts)=>{calls.push({url,opts});if(change.onFetch)return change.onFetch(url,opts,char);return change.externalResponse || new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))}}]}),{status:200});}
   };
   const sandbox={risuai:api,ChronicleCore:C,ChronicleProviders:P,ChronicleRetrieval:R,ChronicleStorage:S,ChroniclePlatform:{...E,assertMemory:()=>E.assertMemory('environment'in change?change.environment:globalThis)},structuredClone,TextEncoder,crypto:globalThis.crypto,
-    setTimeout:change.timers?((fn,ms)=>{change.timers.push(ms);return setTimeout(fn,ms);}):setTimeout,clearTimeout,URL,Response,console};
+    setTimeout:change.timers?((fn,ms)=>{change.timers.push(ms);return setTimeout(fn,ms);}):setTimeout,clearTimeout,URL,Response,console,
+    ...(change.document?{document:change.document}:{}),...(change.clock?{Date:change.clock}:{})};
   await vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../runtime.js'),'utf8'),sandbox);
   return {store,char,hooks,calls,writes,registrations,getState:()=>JSON.parse(store.get('risu-chronicle:v1:chat:character-1:chat-1')||'null'),getRecall:()=>JSON.parse(store.get('risu-chronicle:v1:recall:character-1:chat-1')||'null'),getVectors:()=>JSON.parse(store.get('risu-chronicle:v1:vectors:character-1:chat-1')||'{"entries":{}}')};
 }
@@ -56,6 +57,77 @@ test('processing status is persisted while a summary is pending, without a timeo
   const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began;
   assert.equal(JSON.parse(h.store.get('risu-chronicle:v1:health')).status,'running');assert.equal(h.calls.length,1);
   finish();await task;assert.equal(JSON.parse(h.store.get('risu-chronicle:v1:health')).status,'ok');assert.equal(h.calls.length,1);
+});
+function waitDocument(){const listeners={};return {listeners,getElementById:()=>null,addEventListener:(name,fn)=>listeners[name]=fn};}
+function controlled(){let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};}
+test('manual wait stop releases queued RP, preserves raw and ignores a late summary',async()=>{
+  const doc=waitDocument(),began=controlled(),reply=controlled();let now=Date.now();
+  class Clock extends Date{static now(){return now;}}
+  const h=await setup({}, {document:doc,clock:Clock,onCall:async opts=>{began.resolve();return reply.promise;}});
+  const input=formatted(h.char.chats[0].message),first=h.hooks.beforeRequest(input,'model');await began.promise;
+  const queued=h.hooks.beforeRequest(input,'model');doc.listeners.click({target:{id:'stopWait'}});
+  const [a,b]=await Promise.all([first,queued]);
+  assert(a.some(m=>m.memo==='u1'));assert(b.some(m=>m.memo==='u1'));assert.equal(h.getState().entries.length,0);assert.equal(h.calls.length,1);
+  // Even after the normal error cooldown, a detached pending call is not duplicated.
+  now+=61000;await h.hooks.beforeRequest(input,'model');assert.equal(h.calls.length,1);
+  const snapshot=JSON.stringify(h.getState()),writes=h.writes.length;
+  reply.resolve({type:'success',result:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))});
+  await new Promise(r=>setImmediate(r));
+  assert.equal(JSON.stringify(h.getState()),snapshot);assert.equal(h.writes.length,writes);
+});
+test('a stopped request rejecting late cannot write errors or block future summaries after cooldown',async()=>{
+  const doc=waitDocument(),began=controlled(),reply=controlled();let now=Date.now(),n=0;
+  class Clock extends Date{static now(){return now;}}
+  const h=await setup({}, {document:doc,clock:Clock,onCall:async opts=>{
+    if(++n===1){began.resolve();return reply.promise;}
+    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+  }});
+  const input=formatted(h.char.chats[0].message),task=h.hooks.beforeRequest(input,'model');await began.promise;
+  doc.listeners.click({target:{id:'stopWait'}});await task;const saved=JSON.stringify(h.getState());
+  reply.reject(Error('late transport failure'));await new Promise(r=>setImmediate(r));assert.equal(JSON.stringify(h.getState()),saved);
+  now+=61000;await h.hooks.beforeRequest(input,'model');assert.equal(n,2);assert.equal(C.covered(h.getState()),5);
+});
+test('stopping during Vertex authorization prevents a later model request from the abandoned task',async()=>{
+  const {privateKey}=require('node:crypto').generateKeyPairSync('rsa',{modulusLength:2048});
+  const secret=JSON.stringify({type:'service_account',client_email:'stop-test@example.invalid',project_id:'test',private_key:privateKey.export({type:'pkcs8',format:'pem'})});
+  const doc=waitDocument(),began=controlled(),reply=controlled();
+  const h=await setup({provider:'vertex',model:'gemini-test',project:'test'},
+    {document:doc,credentials:{'risu-chronicle:v1:credential:vertex':secret},onFetch:async()=>{began.resolve();return reply.promise;}});
+  const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began.promise;
+  assert.match(h.calls[0].url,/oauth2/);doc.listeners.click({target:{id:'stopWait'}});await task;
+  reply.resolve(new Response(JSON.stringify({access_token:'mock-token',expires_in:3600}),{status:200}));
+  await new Promise(r=>setImmediate(r));assert.equal(h.calls.length,1);assert.equal(C.covered(h.getState()),0);
+});
+test('stopping a later batch preserves a completed chunk and keeps the unfinished batch verbatim',async()=>{
+  const doc=waitDocument(),began=controlled(),reply=controlled();let n=0;
+  const h=await setup({batchesPerRequest:2},{document:doc,onCall:async opts=>{
+    if(++n===2){began.resolve();return reply.promise;}
+    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+  }});
+  const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began.promise;
+  const id=h.getState().entries[0].id;doc.listeners.click({target:{id:'stopWait'}});const out=await task;
+  assert.equal(C.covered(h.getState()),5);assert.equal(h.getState().entries[0].id,id);
+  assert(!out.some(m=>m.memo==='u1'));assert(out.some(m=>m.memo==='u6'));
+  reply.resolve({type:'success',result:JSON.stringify(chunk([6,7,8,9,10].map(turn=>({turn}))))});
+  await new Promise(r=>setImmediate(r));assert.equal(C.covered(h.getState()),5);
+});
+test('stopping a hybrid embedding wait keeps summary state and falls back without committing late vectors',async()=>{
+  const doc=waitDocument(),began=controlled(),reply=controlled();
+  const h=await setup({mode:'hybrid',embeddingProvider:'openai',embeddingModel:'text-embedding-3-small',embeddingReuseCredential:false},
+    {document:doc,credentials:{'risu-chronicle:v1:embedding-credential:openai':'test-key'},onFetch:async()=>{began.resolve();return reply.promise;}});
+  const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began.promise;
+  doc.listeners.click({target:{id:'stopWait'}});const out=await task;
+  assert.equal(C.covered(h.getState()),5);assert(out.some(m=>m.memo===C.MARK));assert.deepEqual(Object.keys(h.getVectors().entries),[]);
+  const writes=h.writes.length;reply.resolve(new Response(JSON.stringify({data:[{index:0,embedding:[1,0]}]}),{status:200}));
+  await new Promise(r=>setImmediate(r));assert.equal(h.writes.length,writes);assert.deepEqual(Object.keys(h.getVectors().entries),[]);
+});
+test('full-source guard detects a same-length early edit while the last message and count stay unchanged',async()=>{
+  const h=await setup({}, {onCall:async(opts,char)=>{
+    const old=char.chats[0].message[1].data;char.chats[0].message[1].data='변경1';assert.equal(old.length,'변경1'.length);
+    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+  }});
+  await assert.rejects(()=>h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model'),/대화\/원문이 바뀌어/);
+  assert.equal(h.getState().entries.length,0);
 });
 test('native submodel generates a chunk, injects it, and preserves recent raw',async()=>{
   const h=await setup();const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');

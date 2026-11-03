@@ -7,9 +7,10 @@
   if (!api) throw Error('RisuAI API 3.0이 필요합니다.');
   const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:', HEALTH=NS+'health';
   let serial=Promise.resolve(), lastStatus='준비됨', uiContext=null, uiState=null, failedUntil=new Map(), embeddingFailedUntil=new Map(),recoveringConfig=false;
-  let activeOperation=null,lastHealth=null,preparedBackup=null;
+  let activeOperation=null,lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,working=0;
+  const detachedRequests=new Map(),timeline=C.createTimelineReader();
   const exclusive=fn=>{
-    const task=serial.then(fn); serial=task.catch(()=>{}); return task;
+    const task=serial.then(async()=>{working++;try{return await fn();}finally{working--;renderHealth();}}); serial=task.catch(()=>{}); return task;
   };
   async function read(key,fallback) {
     const value=await api.pluginStorage.getItem(key);
@@ -17,14 +18,46 @@
     return typeof value==='string'?JSON.parse(value):value;
   }
   const save=(key,value)=>api.pluginStorage.setItem(key,JSON.stringify(value));
+  function waitError(code,message){const e=Error(message);e.code=code;return e;}
+  function stopWaiting() {
+    const op=activeOperation;if(!op||op.stopped)return;
+    op.stopped=true;
+    if(op.started)detachedRequests.set(op.key,op);
+    op.stop(waitError('CHRONICLE_WAIT_STOPPED','기억 호출 기다리기를 중단했습니다. 저장한 청크와 미요약 원문은 유지합니다.'));
+    renderHealth();
+    notify('기다리기를 중단했습니다. 늦은 응답은 기록에 반영하지 않습니다. 서버 호출·과금의 취소는 보장하지 않으며, 이전 호출이 끝나기 전에는 이 채팅에서 새 기억 호출을 시작하지 않습니다.');
+  }
+  async function waitForModel(ctx,label,fn,range={}) {
+    if(detachedRequests.has(ctx.key))throw waitError('CHRONICLE_WAIT_PENDING','중단한 이전 기억 호출이 아직 끝나지 않았습니다. 이번 요청은 미요약 원문을 유지하며 새 기억 호출을 생략합니다.');
+    let stop;const stopped=new Promise((_,reject)=>stop=reject);
+    // Register a handler immediately, including a stop during the status write.
+    stopped.catch(()=>{});
+    const op={key:ctx.key,label,...range,stop,stopped:false,started:false};
+    activeOperation=op;renderHealth();
+    try {
+      await health('running',label+' 응답 대기 중입니다. 자동 대기 제한은 없으며 설정창에서 기다리기만 중단할 수 있습니다.');
+      if(op.stopped)await stopped;
+      const guarded={};
+      for(const name of ['nativeFetch','runLLMModel'])guarded[name]=(...args)=>{
+        if(op.stopped)throw waitError('CHRONICLE_WAIT_STOPPED','중단한 작업의 후속 API 호출을 생략했습니다.');
+        return api[name](...args);
+      };
+      const job=Promise.resolve().then(()=>{if(op.stopped)return stopped;op.started=true;return fn(guarded);});
+      const settled=()=>{if(detachedRequests.get(ctx.key)===op)detachedRequests.delete(ctx.key);};
+      job.then(settled,settled);
+      const value=await Promise.race([job,stopped]);if(op.stopped)await stopped;return value;
+    }finally{if(activeOperation===op)activeOperation=null;renderHealth();}
+  }
   function renderHealth() {
     if(typeof document==='undefined')return;
+    const button=document.getElementById('stopWait');
+    if(button){button.hidden=!activeOperation;button.disabled=!activeOperation||activeOperation.stopped;}
     const panel=document.getElementById('health');if(!panel)return;
     const env=E.memoryError(),h=lastHealth;
     const label={running:'요약 처리 중',ok:'기억 처리 정상',warning:'주의 · 기억 처리 일부 실패',skipped:'기억 처리 건너뜀'}[h?.status]||'아직 처리 기록 없음';
-    const pending=h?.status==='running'&&!activeOperation?'이전 요약의 완료 여부를 확인하지 못했습니다. 저장된 기록까지 유지하며 다음 RP 요청 또는 미처리 구간 요약에서 남은 구간을 확인합니다. 다른 탭에서 처리 중이라면 완료 후 확인하세요.':h?.message||'';
+    const pending=h?.status==='running'&&!activeOperation&&!working?'이전 기억 호출의 완료 여부를 확인하지 못했습니다. 저장된 기록까지 유지하며 다음 RP 요청 또는 미처리 구간 요약에서 남은 구간을 확인합니다. 다른 탭에서 처리 중이라면 완료 후 확인하세요.':h?.message||'';
     panel.textContent=[env||label,h?.at?`마지막 기록: ${new Date(h.at).toLocaleString()}`:'',pending].filter(Boolean).join('\n');
-    panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!activeOperation)?'true':'false';
+    panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!activeOperation&&!working)?'true':'false';
   }
   async function health(status,message) {
     lastHealth={status,message:P.safeError(message),at:new Date().toISOString()};renderHealth();
@@ -62,7 +95,7 @@
   }
   async function context() {
     E.assertMemory();const ctx=await conversation();
-    return {...ctx,tl:await C.timeline(ctx.chat.message)};
+    return {...ctx,tl:await timeline(ctx.chat.message)};
   }
   async function persistState(ctx,state) {
     await D.sync(ctx.key,state);
@@ -114,12 +147,12 @@
   }
   async function unchanged(ctx) {
     let now;
-    try{now=await context();}catch{const error=Error('처리 중 대화/원문이 바뀌어 결과를 폐기했습니다. 다시 시도하세요.');error.code='CHRONICLE_CONTEXT_CHANGED';throw error;}
-    if(now.key!==ctx.key || now.tl.fingerprint!==ctx.tl.fingerprint){const error=Error('처리 중 대화/원문이 바뀌어 결과를 폐기했습니다. 다시 시도하세요.');error.code='CHRONICLE_CONTEXT_CHANGED';throw error;}
+    try{now=await conversation();}catch{const error=Error('처리 중 대화/원문이 바뀌어 결과를 폐기했습니다. 다시 시도하세요.');error.code='CHRONICLE_CONTEXT_CHANGED';throw error;}
+    if(now.key!==ctx.key || C.sourceText(now.chat.message)!==ctx.tl.sourceText){const error=Error('처리 중 대화/원문이 바뀌어 결과를 폐기했습니다. 다시 시도하세요.');error.code='CHRONICLE_CONTEXT_CHANGED';throw error;}
   }
-  async function summarize(batch,s,ctx) {
+  async function summarize(batch,s,ctx,transport=api) {
     const messages=C.summaryPrompt(batch,s,ctx),started=Date.now();
-    const text=await P.complete(api,s,await credential(s.provider),messages);
+    const text=await P.complete(transport,s,await credential(s.provider),messages);
     const parsed=C.parseSummary(text,batch,s);
     return {text:parsed,stats:{from:batch[0].number,to:batch.at(-1).number,summaryChars:parsed.contentChars,summaryTargetChars:parsed.targetChars,
       originalChars:C.chars(JSON.stringify(C.summaryInput(batch,{...s,cleanSummaryInput:false},ctx))),
@@ -134,9 +167,7 @@
       const failureKey=ctx.key+':'+batch.at(-1).hash;
       if(!force && (failedUntil.get(failureKey)||0)>Date.now()) break;
       try {
-        activeOperation={from:batch[0].number,to:batch.at(-1).number};
-        await health('running',`T${activeOperation.from}~T${activeOperation.to} 요약 응답 대기 중입니다. 화면을 끄거나 탭을 이동하면 처리가 지연·중단될 수 있습니다. 응답을 기다리는 동안 중복 호출하지 않습니다.`);
-        const result=await summarize(batch,s,ctx);
+        const result=await waitForModel(ctx,`T${batch[0].number}~T${batch.at(-1).number} 요약`,transport=>summarize(batch,s,ctx,transport),{from:batch[0].number,to:batch.at(-1).number});
         await unchanged(ctx);
         current=C.commit(current,batch,result.text);current.lastSummaryInput=result.stats;
         await persistState(ctx,current); failedUntil.delete(failureKey);
@@ -146,9 +177,9 @@
         failedUntil.set(failureKey,Date.now()+60000);
         current.lastError=e.message; await persistState(ctx,current);
         lastStatus=e.message;
-        await health('warning','요약 실패 · 저장된 기억과 미처리 원문을 유지합니다. '+P.safeError(e));
+        await health(e.code==='CHRONICLE_WAIT_STOPPED'||e.code==='CHRONICLE_WAIT_PENDING'?'skipped':'warning','저장된 기억과 미처리 원문을 유지합니다. '+P.safeError(e));
         break; // The failed chunk and every later chunk stay verbatim.
-      }finally{activeOperation=null;renderHealth();}
+      }
     }
     return current;
   }
@@ -171,7 +202,7 @@
         }
         const batch=pending.slice(0,s.embeddingBatchesPerRequest);
         if(batch.length){
-          const vectors=await P.embed(api,s,secret,batch.map(row=>R.document(row.entry)));
+          const vectors=await waitForModel(ctx,'요약 청크 임베딩',transport=>P.embed(transport,s,secret,batch.map(row=>R.document(row.entry))));
           await unchanged(ctx);
           for(let i=0;i<batch.length;i++)index.entries[batch[i].entry.id]={signature,hash:batch[i].hash,vector:vectors[i]};
           dirty=true;
@@ -180,7 +211,7 @@
         if(candidates.length&&query){
           const hash=await C.digest(query),cached=D.query(ctx.key);
           if(cached?.signature===signature&&cached.hash===hash&&R.validVector(cached.vector))vector=cached.vector;
-          else{[vector]=await P.embed(api,s,secret,[query],'query');await unchanged(ctx);D.saveQuery(ctx.key,{signature,hash,vector});}
+          else{[vector]=await waitForModel(ctx,'최근 입력 임베딩',transport=>P.embed(transport,s,secret,[query],'query'));await unchanged(ctx);D.saveQuery(ctx.key,{signature,hash,vector});}
           if(candidates.some(e=>index.entries[e.id].vector.length!==vector.length)){
             index.entries=Object.create(null);D.clearQuery(ctx.key);dirty=true;vector=null;
             throw Error('임베딩 차원이 바뀌었습니다. 다음 요청에서 색인을 다시 만듭니다.');
@@ -222,10 +253,10 @@
       try{
         const global=await config(),base=await conversation(),s=C.chatSettings(global,base.chat);
         if(!s.enabled)return messages;
-        E.assertMemory();const ctx={...base,tl:await C.timeline(base.chat.message)};
+        E.assertMemory();const ctx={...base,tl:await timeline(base.chat.message)};
         const initial=await stateFor(ctx),state=await generate(ctx,initial,s);
-        await unchanged(ctx);
-        const result=s.mode==='hybrid'&&state.entries.length?await recall(ctx,state,s):{text:'',warnings:[]};
+        let result={text:'',warnings:[]};
+        if(s.mode==='hybrid'&&state.entries.length){await unchanged(ctx);result=await recall(ctx,state,s);}
         await unchanged(ctx);
         const warnings=[...s.settingWarnings,...(state.summaryWarnings||[]),...result.warnings];
         const out=C.inject(messages,state,ctx.tl,s,text=>warnings.push(text),result.text),warning=warnings.join('\n');
@@ -342,16 +373,25 @@
   }
   function action(id,fn) {
     $(id).onclick=async()=>{
+      if(uiBusy)return;
+      if(id!=='confirmDelete')clearDelete();
+      uiBusy=true;
       const controls=[...document.querySelectorAll('button,input,select,textarea')],previous=controls.map(b=>b.disabled);
-      controls.forEach(b=>b.disabled=true);
-      try{await exclusive(fn);}catch(e){notify(e.message);}
-      finally{controls.forEach((b,i)=>b.disabled=previous[i]);}
+      controls.forEach(b=>{if(!['close','stopWait','cancelDelete'].includes(b.id))b.disabled=true;});
+      try{
+        await exclusive(fn);
+        if(lastHealth?.status==='running'&&!activeOperation)await health('ok','설정창의 기억 호출 작업을 완료했습니다.');
+      }catch(e){
+        if(lastHealth?.status==='running'&&!activeOperation)await health(e.code==='CHRONICLE_WAIT_STOPPED'||e.code==='CHRONICLE_WAIT_PENDING'?'skipped':'warning',P.safeError(e));
+        notify(e.message);
+      }
+      finally{controls.forEach((b,i)=>b.disabled=previous[i]);uiBusy=false;renderHealth();}
     };
   }
-  async function loadEditor() {
+  async function loadEditor(readOnly=false) {
     uiContext=await context();
-    const old=await stateFor(uiContext); uiState=C.reconcile(old,uiContext.tl);
-    if(old.revision!==uiState.revision) await persistState(uiContext,uiState);
+    const old=readOnly?C.validateState(await read(uiContext.key,C.emptyState())):await stateFor(uiContext); uiState=C.reconcile(old,uiContext.tl);
+    if(!readOnly&&old.revision!==uiState.revision) await persistState(uiContext,uiState);
     const state=uiState,ctx=uiContext;
     const cfg=C.chatSettings(await config(true),ctx.chat),unprocessed=ctx.tl.turns.length-C.covered(state);
     $('chatTitle').textContent=`${ctx.charName} / ${ctx.chatName || '대화'} · 완료 ${ctx.tl.turns.length}턴 · 요약 ${C.covered(state)}턴 · 미처리 ${unprocessed}턴 · 주기 ${cfg.interval}턴 · 보관 ${state.archive.length}묶음`;
@@ -393,8 +433,8 @@
     $('recallState').textContent=(cfg.mode==='risu'?'Risu 기억 병행: 자체 자동 검색은 실행하지 않습니다. ':'')+(recallInfo?`임베딩 색인 ${recallInfo.indexed}/${recallInfo.total}개${recallInfo.total>0&&recallInfo.indexed===recallInfo.total?' 완료':''} · 마지막 실행: ${searchLabel} · 재강조 ${recallInfo.selected.length}개. 자체 하이브리드에서만 이 재강조 기록을 보냅니다.`:'아직 자체 하이브리드 검색을 실행하지 않았습니다.');
     notify((await config(true)).configWarning||state.lastError||lastStatus);
   }
-  async function refreshEditor(){
-    try{await loadEditor();}catch(e){
+  async function refreshEditor(readOnly=false){
+    try{await loadEditor(readOnly);}catch(e){
       uiContext=null;uiState=null;
       $('chatTitle').textContent='현재 대화의 기억 편집을 사용할 수 없습니다: '+P.safeError(e);
       $('entries').textContent='1:1 대화를 열면 현재 기억을 편집할 수 있습니다. 전역 설정과 저장된 기억 관리는 계속 사용할 수 있습니다.';
@@ -431,6 +471,21 @@
     failedUntil.clear();embeddingFailedUntil.clear();await refreshEditor();await loadCaches();
     notify(`${keys.length}개 채팅의 저장된 기억·보관함을 삭제했습니다. 원문 대화와 API 키는 유지합니다. 계속 사용하면 이후 요약은 새로 저장됩니다.`);
   }
+  function clearDelete() {
+    pendingDelete=null;
+    if(typeof document!=='undefined'&&$('deleteConfirmation'))$('deleteConfirmation').hidden=true;
+  }
+  function askDelete(label,keys) {
+    pendingDelete={label,keys:[...keys]};
+    $('deleteTarget').textContent=label+` · ${keys.length}개 채팅 기록`;
+    $('deleteConfirmation').hidden=false;$('deleteConfirmation').focus();
+    notify('삭제 대상을 확인한 뒤 삭제 확인 또는 취소를 누르세요.');
+  }
+  function openSettings() {
+    if(opening)return opening;
+    if(uiBusy){renderHealth();return api.showContainer('fullscreen');}
+    opening=open().finally(()=>opening=null);return opening;
+  }
   async function open() {
     const s=await config(true);
     try{lastHealth=await read(HEALTH,null);}catch{lastHealth=null;}
@@ -455,8 +510,8 @@
       .downloadLink{display:inline-block;min-height:44px;padding:10px 15px;background:#a8dfcb;color:#10221c;border-radius:6px;font-weight:700;text-decoration:underline}
       input,select,textarea{font-size:16px;min-width:0}button{min-height:44px}header>div{min-width:0}main,section{overflow-wrap:anywhere}
       @media(max-width:600px){main{padding:12px}section{padding:14px}header{flex-wrap:wrap;align-items:flex-start}h1{font-size:22px}.grid{grid-template-columns:minmax(0,1fr)}.row>button{max-width:100%}}`+'</style>';
-    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.4</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
-      <section><h2>실행 환경 · 최근 기억 처리</h2><p id="health" role="status"></p><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다.</p></details></section>
+    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.5</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
+      <section><h2>실행 환경 · 최근 기억 처리</h2><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>중단하면 늦은 응답을 기록에 반영하지 않고 미요약 원문을 유지합니다. 서버 호출·과금 취소는 보장하지 않습니다. 이전 호출이 끝나기 전에는 같은 채팅에서 새 기억 호출을 시작하지 않습니다. 대기 중에도 이 설정창은 열 수 있습니다. 설정 저장·기록 수정·삭제는 진행 중인 작업이 끝난 뒤 처리하므로 필요하면 기다리기를 먼저 중단하세요.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다. Risu 저장소는 실제 디스크 반영이 지연될 수 있어 기록 완료 직후 앱을 강제 종료하면 최근 기록이 남지 않을 수 있습니다.</p><p>API 요청은 Risu의 네트워크 설정을 따릅니다. 웹 환경에서 프록시를 사용하면 요청 내용과 인증정보가 해당 프록시를 경유할 수 있습니다. 연결 오류는 Risu의 직접 호출·프록시 설정도 확인하세요.</p></details></section>
       <section><h2>이 기억은 어떻게 동작하나요?</h2><p>대화 원문을 설정한 턴 수만큼 묶어 짧은 사건 기록으로 바꾸고, 이전 사건 기록 전체와 최근 원문을 다음 RP 요청에 함께 보냅니다. 오래된 로그를 반복해서 다시 요약하지 않습니다.</p>
       <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다.</p>
       <p><strong>Risu 기억 병행 · 하이파 주력</strong>은 원문 관리와 과거 검색을 Risu에 맡기고, 같은 주기로 만든 짧은 연대기를 덧붙입니다. 기본은 턴당 50글자 목표·누적 로그 전체 주입이며 최근 K청크·기록만도 선택할 수 있습니다. 기존 단독·자체 하이브리드 설정은 그대로 유지합니다.</p>
@@ -525,7 +580,7 @@
       <div class="row"><button id="export" class="secondary">현재 대화 JSON 백업</button><button id="importButton" class="secondary">JSON 복원</button><input id="importFile" type="file" accept="application/json,.json" hidden></div>
       <div id="backupReady" hidden><p>백업 준비 완료 · 아래 링크를 직접 눌러 저장하세요. 파일 저장이 안 되면 JSON 전체를 복사해 별도로 보관할 수 있습니다.</p><div class="row"><a id="backupDownload" class="downloadLink" download="Chronicle_Memory_Backup.json" hidden>JSON 파일 저장</a><button id="selectBackup" class="secondary">JSON 전체 선택</button></div><textarea id="backupText" rows="8" readonly aria-label="백업 JSON 전체"></textarea><small>선택한 JSON에는 대화의 요약 기록이 들어 있습니다. 파일 앱에서 저장 결과를 확인하세요.</small></div>
       <p>복원 시 현재 원문과 맞는 구간만 활성화합니다. 기존 기억은 보관함에 남습니다. API 키·벡터·검색 결과는 백업하지 않으며 필요하면 다시 색인합니다.</p></section>
-      <section><h2>누적 로그 · 검색 재강조 미리보기</h2><small id="counts"></small><textarea id="preview" rows="10" readonly></textarea><p id="recallState"></p><textarea id="recallPreview" rows="7" readonly placeholder="하이브리드에서 선택된 기존 요약 청크"></textarea></section><p id="status" role="status"></p></main>`;
+      <section><h2>누적 로그 · 검색 재강조 미리보기</h2><small id="counts"></small><textarea id="preview" rows="10" readonly></textarea><p id="recallState"></p><textarea id="recallPreview" rows="7" readonly placeholder="하이브리드에서 선택된 기존 요약 청크"></textarea></section><section id="deleteConfirmation" hidden tabindex="-1" aria-labelledby="deleteTitle"><h2 id="deleteTitle">저장 기억 삭제 확인</h2><p id="deleteTarget"></p><p>표시한 대상의 Chronicle 요약·보관함·검색 캐시를 삭제합니다. 원문 대화·설정·API 키는 유지합니다. 별도 백업이 없으면 삭제한 기억은 복구할 수 없습니다.</p><div class="row"><button id="confirmDelete">삭제 확인</button><button id="cancelDelete" class="secondary">취소</button></div></section><p id="status" role="status"></p></main>`;
     $('status').insertAdjacentHTML('beforebegin',`<section><h2>저장된 기억 · 캐시 관리</h2>
       <p>요약과 수동 편집 내용은 Risu 저장 데이터 안에 채팅별로 자동 보관합니다. 같은 채팅으로 돌아오면 JSON 파일 없이 다시 읽습니다. 별도의 txt 파일을 직접 찾아 지울 필요는 없습니다.</p>
       <label><input id="autoRestoreCache" type="checkbox"> 같은 캐릭터의 새 분기에서 공통 원문이 일치하는 기억 자동 재사용</label>
@@ -559,30 +614,31 @@
     };
     action('loadModels',async()=>{
       await saveSettings();const cfg=await config();notify('제공자에서 모델 목록을 불러오는 중…');
-      const list=await P.models(api,cfg,await credential(cfg.provider));
+      const secret=await credential(cfg.provider),list=await waitForModel({key:NS+'ui-api'},'요약 모델 목록',transport=>P.models(transport,cfg,secret));
       $('modelSelect').replaceChildren(new Option('모델을 선택하세요',''),...list.map(m=>new Option(m.name===m.id?m.id:`${m.name} · ${m.id}`,m.id)));
       if(list.some(m=>m.id===cfg.model))$('modelSelect').value=cfg.model;
       notify(`${list.length}개 모델을 불러왔습니다. 선택 후 설정 저장을 누르세요.`);
     });
     action('testConnection',async()=>{
       await saveSettings();const cfg=await config();notify('모델 연결을 시험하는 중…');
-      await P.complete(api,{...cfg,maxOutputTokens:Math.max(cfg.maxOutputTokens,128)},await credential(cfg.provider),[{role:'system',content:'Return exactly the JSON object {"ok":true}. No other text.'},{role:'user',content:'Connection test.'}]);
+      const secret=await credential(cfg.provider);await waitForModel({key:NS+'ui-api'},'요약 연결 시험',transport=>P.complete(transport,{...cfg,maxOutputTokens:Math.max(cfg.maxOutputTokens,128)},secret,[{role:'system',content:'Return exactly the JSON object {"ok":true}. No other text.'},{role:'user',content:'Connection test.'}]));
       notify('연결 성공 · 모델에서 텍스트 응답을 받았습니다.');
     });
-    $('close').onclick=()=>{E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
+    $('cancelDelete').onclick=clearDelete;
+    $('close').onclick=()=>{clearDelete();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
     $('selectBackup').onclick=()=>{$('backupText').focus();$('backupText').select();$('backupText').setSelectionRange(0,$('backupText').value.length);notify('JSON 전체를 선택했습니다. 기기의 복사 기능으로 보관하세요.');};
     action('saveSettings',saveSettings);
     action('saveEmbeddingSettings',saveSettings);
     action('loadEmbeddingModels',async()=>{
       await saveSettings();const cfg=await config();notify('임베딩 모델 목록을 불러오는 중…');
-      const list=await P.embeddingModels(api,cfg,await embeddingCredential(cfg));
+      const secret=await embeddingCredential(cfg),list=await waitForModel({key:NS+'ui-api'},'임베딩 모델 목록',transport=>P.embeddingModels(transport,cfg,secret));
       $('embeddingModelSelect').replaceChildren(new Option('임베딩 모델을 선택하세요',''),...list.map(m=>new Option(m.name===m.id?m.id:`${m.name} · ${m.id}`,m.id)));
       if(list.some(m=>m.id===cfg.embeddingModel))$('embeddingModelSelect').value=cfg.embeddingModel;
       notify(`${list.length}개 임베딩 모델${P.isVoyageEmbedding(cfg)?' · Voyage 기본 목록 (실시간 조회 아님)':''}을 불러왔습니다. 선택 후 전체 설정 저장을 누르세요.`);
     });
     action('testEmbedding',async()=>{
       await saveSettings();const cfg=await config();notify('임베딩 연결을 시험하는 중…');
-      const vectors=await P.embed(api,cfg,await embeddingCredential(cfg),['두 사람이 다음 만남의 장소와 시간을 약속했다.']);
+      const secret=await embeddingCredential(cfg),vectors=await waitForModel({key:NS+'ui-api'},'임베딩 연결 시험',transport=>P.embed(transport,cfg,secret,['두 사람이 다음 만남의 장소와 시간을 약속했다.']));
       notify(`임베딩 연결 성공 · ${vectors[0].length}차원 벡터를 받았습니다. 검색 품질은 실제 대화로 확인하세요.`);
     });
     action('previewRecall',async()=>{
@@ -598,7 +654,7 @@
       notify('현재 대화의 활성 청크 벡터만 초기화했습니다. 요약 본문·보관함은 유지하며 다음 하이브리드 요청에서 다시 색인합니다.');
     });
     action('reload',async()=>{await refreshEditor();await loadCaches();});
-    $('cacheSelect').onchange=()=>{
+    $('cacheSelect').onchange=()=>{clearDelete();
       try{const row=selectedCache();$('cachePreview').value=row.state?C.memoryText(row.state):'이 기록을 읽을 수 없습니다. 삭제할 수는 있습니다.';}catch{$('cachePreview').value='';}
     };
     action('reloadCaches',loadCaches);
@@ -616,16 +672,17 @@
       await D.copy(row.key,ctx.key,next.entries);await persistState(ctx,next);await loadEditor();await loadCaches();notify(`공통 원문 T1~T${C.covered(next)} 기록을 불러왔습니다.`);
     });
     action('deleteCache',async()=>{
-      const row=selectedCache();if(!confirm('선택한 채팅의 저장 기억과 보관함을 삭제할까요? 원문과 API 키는 유지합니다.'))return;
-      await removeCached([row.key]);
+      const row=selectedCache();askDelete(`${row.meta.charName||'캐릭터'} / ${row.meta.chatName||row.meta.chatId||'선택한 채팅'}`, [row.key]);
     });
     action('deleteCurrent',async()=>{
-      const ctx=await context();if(!confirm('현재 채팅의 저장 기억과 보관함을 삭제할까요? 원문과 API 키는 유지합니다.'))return;
-      await removeCached([ctx.key]);
+      const ctx=await conversation();askDelete(`${ctx.charName} / ${ctx.chatName||ctx.chatId}`, [ctx.key]);
     });
     action('deleteAllCaches',async()=>{
-      if(!confirm('모든 캐릭터·채팅의 Chronicle 기억과 보관함을 삭제할까요? 원문과 API 키는 유지합니다.'))return;
-      await removeCached([...new Set([...(await cacheRows()).map(row=>row.key),...await D.derivedChats()])]);
+      askDelete('모든 캐릭터·채팅 · 확인창을 연 시점의 저장 기록', [...new Set([...(await cacheRows()).map(row=>row.key),...await D.derivedChats()])]);
+    });
+    action('confirmDelete',async()=>{
+      const target=pendingDelete;if(!target)throw Error('삭제할 대상을 다시 선택하세요.');
+      clearDelete();await removeCached(target.keys);
     });
     action('generate',async()=>{
       await saveSettings();const ctx=await context();const cfg=C.chatSettings(await config(true),ctx.chat);
@@ -675,16 +732,19 @@
       });}catch(e){notify(e.message);}finally{$('importFile').value='';}
     };
     $('environment').textContent=E.description();renderHealth();
-    await refreshEditor();try{await loadCaches();}catch(e){notify(P.safeError(e));}
+    clearDelete();await refreshEditor(true);try{await loadCaches();}catch(e){notify(P.safeError(e));}
     await api.showContainer('fullscreen');
   }
   await api.addRisuReplacer('beforeRequest',beforeRequest);
-  await api.registerSetting('Chronicle Memory',()=>exclusive(open),'📜','html');
-  await api.registerButton({name:'Chronicle Memory',icon:'📜',iconType:'html',location:'chat'},()=>exclusive(open));
-  if(typeof document!=='undefined'&&typeof document.addEventListener==='function')document.addEventListener('visibilitychange',()=>{
+  await api.registerSetting('Chronicle Memory',openSettings,'📜','html');
+  await api.registerButton({name:'Chronicle Memory',icon:'📜',iconType:'html',location:'chat'},openSettings);
+  if(typeof document!=='undefined'&&typeof document.addEventListener==='function'){
+    document.addEventListener('click',event=>{if(event.target?.id==='stopWait')stopWaiting();});
+    document.addEventListener('visibilitychange',()=>{
     if(document.visibilityState!=='hidden'){
       renderHealth();
-      if(activeOperation&&document.getElementById('status'))notify(`T${activeOperation.from}~T${activeOperation.to} 요약 응답을 기다리고 있습니다. 자동으로 중복 재시도하지 않습니다.`);
+      if(activeOperation&&document.getElementById('status'))notify(`${activeOperation.label} 응답을 기다리고 있습니다. 기다리기 중단을 선택할 수 있으며 자동으로 중복 재시도하지 않습니다.`);
     }
-  });
+    });
+  }
 })();

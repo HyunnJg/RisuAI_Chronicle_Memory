@@ -3,6 +3,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const C=require('../core.cjs');
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 function raw(n,pending=false) {
   const result=[];
   for(let i=1;i<=n;i++)result.push({role:'user',data:`사용자 ${i}`,chatId:`u${i}`},{role:'char',data:`응답 ${i}`,chatId:`a${i}`});
@@ -14,6 +15,32 @@ async function stateWith(n=5,all=10) {
   const tl=await C.timeline(raw(all,true));
   return {tl,state:C.commit(C.emptyState(),tl.turns.slice(0,n),'T1: 금화 20개 수령. T5: 영주에게 보고.')};
 }
+test('timeline cache compares full contents and matches uncached hashes through edits, deletions and branches',async()=>{
+  const reader=C.createTimelineReader(),source=raw(12,true);
+  async function same(value){assert.deepEqual(await reader(value),await C.timeline(value));}
+  await same(source);await same(structuredClone(source));
+  source[1].data='변경 1';await same(source); // Same ID/length as 응답 1.
+  source[0].saying='화자 변경';await same(source);
+  source[3].chatId='replacement';await same(source);
+  source[4].role='assistant';await same(source);
+  source[8].disabled=true;await same(source);
+  source[9].isComment=true;await same(source);
+  source[10].disabled='allBefore';await same(source);
+  await same(source.slice(0,7));await same(raw(18,true));await same(raw(5));
+  const branch=raw(18,true);branch[4].data='분기 원문';await same(branch);
+  branch.at(-1).data='다른 현재 입력';await same(branch);
+});
+test('unchanged prefixes reuse SHA-256 results but an equal-length early edit rebuilds both chains',async()=>{
+  let hashes=0;const sandbox={module:{exports:{}},TextEncoder,crypto:{subtle:{digest:(...args)=>{hashes++;return crypto.subtle.digest(...args);}}}};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../core.cjs'),'utf8'),sandbox);
+  const cached=sandbox.module.exports,reader=cached.createTimelineReader(),source=raw(5);
+  await reader(source);assert.equal(hashes,11);
+  hashes=0;await reader(structuredClone(source));assert.equal(hashes,1);
+  source.push({role:'user',data:'새 입력',chatId:'u6'},{role:'char',data:'새 응답',chatId:'a6'});
+  hashes=0;await reader(source);assert.equal(hashes,3);
+  source[1].data='변경 1';hashes=0;const result=await reader(source);assert.equal(hashes,13);
+  assert.equal(JSON.stringify(result),JSON.stringify(await C.timeline(source)));
+});
 test('settings reject invalid ranges and unsupported modes',()=>{
   assert.equal(C.settings().enabled,false);
   for(const value of [0,4,21,NaN,5.5])assert.throws(()=>C.settings({interval:value}));

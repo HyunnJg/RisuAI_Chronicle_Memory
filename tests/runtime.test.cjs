@@ -30,6 +30,28 @@ test('plugin registers UI and main hook; auxiliary requests pass through',async(
   const h=await setup();assert.equal(h.registrations,2);
   const input=formatted(raw(10));assert.equal(await h.hooks.beforeRequest(input,'memory'),input);assert.equal(h.calls.length,0);
 });
+test('optional preset storage never changes the active summary prompt or blocks RP when corrupt',async()=>{
+  const h=await setup({customPrompt:'적용 중인 지침: 약속을 우선한다.'});
+  const presets=S.createPromptPresets({getItem:async k=>h.store.get(k),setItem:async(k,v)=>h.store.set(k,v)},'risu-chronicle:v1:summary-presets');
+  await presets.put('병행용','아직 적용하지 않은 지침');
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.match(h.calls[0].messages[0].content,/적용 중인 지침: 약속/);
+  assert(!h.calls[0].messages[0].content.includes('아직 적용하지 않은'));
+  h.store.set('risu-chronicle:v1:summary-presets','{invalid');
+  h.char.chats[0].message=raw(15);await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.equal(C.covered(h.getState()),10);assert.equal(h.calls.length,2);
+  assert.equal(h.store.get('risu-chronicle:v1:summary-presets'),'{invalid');
+});
+test('summary instruction changes affect only the next new chunk and never regenerate committed chunks',async()=>{
+  const h=await setup({customPrompt:'단독용 지침'});
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  const first=structuredClone(h.getState().entries[0]);
+  const key='risu-chronicle:v1:settings',settings=JSON.parse(h.store.get(key));
+  h.store.set(key,JSON.stringify({...settings,customPrompt:'하이파 병행용 지침',mode:'risu'}));
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.match(h.calls[1].messages[0].content,/하이파 병행용 지침/);
+  assert.deepEqual(h.getState().entries[0],first);assert.equal(C.covered(h.getState()),10);
+});
 test('staircase advances at commits, survives reload and keeps extra raw after a failed next chunk',async()=>{
   let n=0;const h=await setup({rawTrim:'chunk',batchesPerRequest:2},{onCall:async opts=>{
     if(++n===3)return {type:'fail',result:'next chunk failed'};

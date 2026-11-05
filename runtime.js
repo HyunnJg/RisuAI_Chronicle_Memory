@@ -64,6 +64,8 @@
     try{await save(HEALTH,lastHealth);}catch{/* Diagnostics must not block RP or overwrite narrative state. */}
   }
   const D=ChronicleStorage.create(api.pluginStorage,NS,{validVector:R.validVector,entryHash:entry=>C.digest(R.document(entry))});
+  const prompts=ChronicleStorage.createPromptPresets(api.pluginStorage,NS+'summary-presets');
+  let visiblePromptPresets=[],pendingPromptDelete=null;
   async function config(recover=false){
     try{return C.settings(await read(SETTINGS,C.DEFAULTS));}
     catch(e){if(!recover)throw e;return {...C.DEFAULTS,configWarning:'저장된 설정을 읽을 수 없어 화면에 기본값을 표시합니다. 현재 RP 요청은 기억 처리를 건너뜁니다. 값을 확인하고 전체 설정 저장을 눌러 복구하세요. '+P.safeError(e)};}
@@ -294,6 +296,17 @@
   }
   const $=id=>document.getElementById(id);
   function notify(text) {lastStatus=redact(text); if($('status')) $('status').textContent=lastStatus;}
+  function clearPromptDelete(){pendingPromptDelete=null;if($('promptDeleteConfirmation'))$('promptDeleteConfirmation').hidden=true;}
+  function selectedPrompt(){
+    const preset=visiblePromptPresets.find(item=>item.name===$('promptPreset').value);
+    if(!preset)throw Error('먼저 저장된 지침 프리셋을 선택하세요.');return preset;
+  }
+  async function refreshPromptPresets(name=''){
+    visiblePromptPresets=await prompts.list();
+    $('promptPreset').replaceChildren(new Option('저장된 지침을 선택하세요',''),...visiblePromptPresets.map(item=>new Option(item.name,item.name)));
+    $('promptPreset').value=name;$('promptPresetName').value=name;
+    $('promptPresetCount').textContent=`저장된 프리셋 ${visiblePromptPresets.length}개 · 이름과 추가 요약 지침만 보관합니다.`;
+  }
   function prepareBackup(name,value) {
     E.releaseBackup(preparedBackup);preparedBackup=E.backup(value);
     $('backupText').value=preparedBackup.text;$('backupReady').hidden=false;
@@ -418,9 +431,10 @@
     $(id).onclick=async()=>{
       if(uiBusy)return;
       if(id!=='confirmDelete')clearDelete();
+      if(id!=='confirmPromptDelete')clearPromptDelete();
       uiBusy=true;
       const controls=[...document.querySelectorAll('button,input,select,textarea')],previous=controls.map(b=>b.disabled);
-      controls.forEach(b=>{if(!['close','stopWait','cancelDelete'].includes(b.id))b.disabled=true;});
+      controls.forEach(b=>{if(!['close','stopWait','cancelDelete','cancelPromptDelete'].includes(b.id))b.disabled=true;});
       try{
         await exclusive(fn);
         if(lastHealth?.status==='running'&&!activeOperation)await health('ok','설정창의 기억 호출 작업을 완료했습니다.');
@@ -554,7 +568,7 @@
       .downloadLink{display:inline-block;min-height:44px;padding:10px 15px;background:#a8dfcb;color:#10221c;border-radius:6px;font-weight:700;text-decoration:underline}
       input,select,textarea{font-size:16px;min-width:0}button{min-height:44px}header>div{min-width:0}main,section{overflow-wrap:anywhere}
       @media(max-width:600px){main{padding:12px}section{padding:14px}header{flex-wrap:wrap;align-items:flex-start}h1{font-size:22px}.grid{grid-template-columns:minmax(0,1fr)}.row>button{max-width:100%}}`+'</style>';
-    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.7</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
+    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.8</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
       <section><h2>실행 환경 · 최근 기억 처리</h2><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>중단하면 늦은 응답을 기록에 반영하지 않고 미요약 원문을 유지합니다. 서버 호출·과금 취소는 보장하지 않습니다. 이전 호출이 끝나기 전에는 같은 채팅에서 새 기억 호출을 시작하지 않습니다. 대기 중에도 이 설정창은 열 수 있습니다. 설정 저장·기록 수정·삭제는 진행 중인 작업이 끝난 뒤 처리하므로 필요하면 기다리기를 먼저 중단하세요.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다. Risu 저장소는 실제 디스크 반영이 지연될 수 있어 기록 완료 직후 앱을 강제 종료하면 최근 기록이 남지 않을 수 있습니다.</p><p>API 요청은 Risu의 네트워크 설정을 따릅니다. 웹 환경에서 프록시를 사용하면 요청 내용과 인증정보가 해당 프록시를 경유할 수 있습니다. 연결 오류는 Risu의 직접 호출·프록시 설정도 확인하세요.</p></details></section>
       <section><h2>이 기억은 어떻게 동작하나요?</h2><p>대화 원문을 설정한 턴 수만큼 묶어 짧은 사건 기록으로 바꾸고, 이전 사건 기록 전체와 최근 원문을 다음 RP 요청에 함께 보냅니다. 오래된 로그를 반복해서 다시 요약하지 않습니다.</p>
       <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다. <strong>원문 자르기 → 청크 커밋 시 이동</strong>을 선택하면 같은 조건에서 원문 T6~T12를 유지하고, 다음 T11~T15 청크가 저장되면 원문 T11~T15로 이동합니다.</p>
@@ -580,6 +594,15 @@
       <div id="tokenPanel"><label>토큰 필드<select id="tokenField"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label></div>
       <div id="versionPanel"><label>Anthropic API 버전<input id="anthropicVersion"></label></div></div>
       <label>추가 요약 지침 · 문체와 기록 우선순위<textarea id="customPrompt" rows="4" placeholder="예: 관계 변화·약속·취향을 우선하고 요약은 한국어로 작성"></textarea></label><small>청크 제목·기록 내용·키워드는 기본 형식이며 시점 표현은 선택입니다. 추가 지침에는 JSON 형식을 바꾸는 지시 대신 기록할 내용의 우선순위를 적으세요.</small>
+      <label>요약 지침 프리셋<select id="promptPreset"></select></label>
+      <div class="row"><button id="loadPromptPreset" class="secondary">선택 지침 불러오기</button></div>
+      <small>선택만으로는 지침이 바뀌지 않습니다. 불러오기는 위 편집칸을 교체하며, ‘전체 설정 저장’ 후 새 요약부터 적용합니다. 기존 요약은 다시 만들지 않습니다.</small>
+      <details><summary>지침 프리셋 저장·관리</summary>
+      <label>프리셋 이름<input id="promptPresetName" placeholder="예: 단독용 / 하이파 병행용"></label>
+      <div class="row"><button id="newPromptPreset" class="secondary">새 프리셋 저장</button><button id="updatePromptPreset" class="secondary">선택 프리셋 수정</button><button id="deletePromptPreset" class="secondary">선택 프리셋 삭제</button></div>
+      <small id="promptPresetCount"></small><p>위 편집칸의 지침을 보관합니다. 수정은 선택한 프리셋의 이름과 내용을 바꿉니다. 프리셋 저장·수정은 현재 적용 지침이나 API 연결 설정을 저장하지 않습니다. 모드 변경 시 자동 전환하지 않습니다.</p>
+      <p>프리셋은 이 Risu 저장 환경에서 채팅 간에 공유하며 다시 열어도 남습니다. 채팅 기억 삭제와 별도로 관리하고 기억 JSON 백업에는 포함하지 않습니다. 빈 지침도 저장할 수 있습니다.</p>
+      <div id="promptDeleteConfirmation" hidden tabindex="-1" role="group" aria-label="지침 프리셋 삭제 확인"><p id="promptDeleteTarget"></p><p>선택한 프리셋만 삭제합니다. 현재 편집 중이거나 적용된 지침은 유지합니다.</p><div class="row"><button id="confirmPromptDelete">프리셋 삭제 확인</button><button id="cancelPromptDelete" class="secondary">취소</button></div></div></details>
       <div class="row"><button id="saveSettings">전체 설정 저장</button><button id="testConnection" class="secondary">요약 연결 시험 · 짧은 모델 호출</button></div>
       <p>연결 시험은 별도 모델 호출이며 소액 과금될 수 있습니다. API 키·서비스 계정 JSON은 기억 백업에 포함하지 않습니다.</p></section>
       <section><h2>플러그인 기본값 · 모듈에서 상속할 동작</h2><label><input id="enabled" type="checkbox"> 플러그인 기본값으로 기억 사용</label>
@@ -637,6 +660,29 @@
       <p>백업의 원문 일치 검사는 요약 내용의 진실성·작성자를 인증하지 않습니다. 신뢰할 수 있는 백업만 복원하세요. 캐시는 대화를 이동해도 남습니다. Risu 저장 데이터를 초기화하거나 별도 저장본으로 바꾸면 달라질 수 있으므로 중요한 기록은 JSON 백업도 보관하세요. 삭제 후에도 자동 요약을 계속 사용하면 이후 기록은 다시 생성됩니다.</p></section>`);
     for(const key of Object.keys(C.DEFAULTS)) {if(!$(key)) continue; if(['enabled','allowPlugins','autoRestoreCache','cleanSummaryInput','embeddingReuseCredential'].includes(key)) $(key).checked=s[key];else $(key).value=s[key];}
     modeControls();$('mode').onchange=modeControls;$('risuLogScope').onchange=modeControls;
+    $('promptPreset').onchange=()=>{clearPromptDelete();$('promptPresetName').value=$('promptPreset').value;};
+    action('loadPromptPreset',async()=>{
+      const selected=selectedPrompt(),latest=(await prompts.list()).find(item=>item.name===selected.name);
+      if(!latest||latest.prompt!==selected.prompt)throw Error('선택한 프리셋이 변경되거나 삭제되었습니다. 설정창을 다시 열고 선택하세요.');
+      $('customPrompt').value=latest.prompt;notify('지침을 편집칸에 불러왔습니다. 전체 설정 저장을 누르면 새 요약부터 적용합니다.');
+    });
+    action('newPromptPreset',async()=>{
+      const item=await prompts.put($('promptPresetName').value,$('customPrompt').value);
+      await refreshPromptPresets(item.name);notify('새 지침 프리셋을 보관했습니다. 실제 적용은 전체 설정 저장을 누르세요.');
+    });
+    action('updatePromptPreset',async()=>{
+      const item=await prompts.put($('promptPresetName').value,$('customPrompt').value,selectedPrompt());
+      await refreshPromptPresets(item.name);notify('선택 프리셋의 이름·지침을 수정했습니다. 실제 적용은 전체 설정 저장을 누르세요.');
+    });
+    action('deletePromptPreset',async()=>{
+      pendingPromptDelete={...selectedPrompt()};$('promptDeleteTarget').textContent='삭제할 프리셋: '+pendingPromptDelete.name;
+      $('promptDeleteConfirmation').hidden=false;$('promptDeleteConfirmation').focus();notify('삭제할 지침 프리셋을 확인하거나 취소하세요.');
+    });
+    $('cancelPromptDelete').onclick=clearPromptDelete;
+    action('confirmPromptDelete',async()=>{
+      const target=pendingPromptDelete;clearPromptDelete();if(!target)throw Error('삭제할 프리셋을 다시 선택하세요.');
+      await prompts.remove(target);await refreshPromptPresets();notify('지침 프리셋을 삭제했습니다. 편집 중·적용 중인 지침은 유지합니다.');
+    });
     await showConnection(s.provider);
     await showEmbedding(s.embeddingProvider);
     $('provider').onchange=async()=>{captureConnection();await showConnection($('provider').value);};
@@ -676,7 +722,7 @@
       notify('연결 성공 · 모델에서 텍스트 응답을 받았습니다.');
     });
     $('cancelDelete').onclick=clearDelete;
-    $('close').onclick=()=>{clearDelete();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
+    $('close').onclick=()=>{clearDelete();clearPromptDelete();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
     $('selectBackup').onclick=()=>{$('backupText').focus();$('backupText').select();$('backupText').setSelectionRange(0,$('backupText').value.length);notify('JSON 전체를 선택했습니다. 기기의 복사 기능으로 보관하세요.');};
     action('saveSettings',saveSettings);
     action('saveEmbeddingSettings',saveSettings);
@@ -781,6 +827,7 @@
     };
     $('environment').textContent=E.description();renderHealth();
     clearDelete();await refreshEditor(true);try{await loadCaches();}catch(e){notify(P.safeError(e));}
+    clearPromptDelete();try{await refreshPromptPresets();}catch(e){$('promptPresetCount').textContent='프리셋 읽기 실패 · 저장 데이터는 유지합니다.';notify(e.message);}
     await api.showContainer('fullscreen');
   }
   await api.addRisuReplacer('beforeRequest',beforeRequest);

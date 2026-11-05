@@ -2,6 +2,38 @@
 // Copyright (C) 2026 HyunnJg. See LICENSE; provided without warranty.
 /* Derived retrieval data is separate from durable narrative state. */
 const ChronicleStorage=(()=>{
+  // Kept outside settings and chat state: managing prompts must not save API drafts
+  // or make RP depend on this optional collection being readable.
+  function createPromptPresets(storage,key){
+    const invalid=()=>Error('요약 지침 프리셋 저장 데이터를 읽을 수 없습니다. 기존 데이터를 덮어쓰지 않았습니다.');
+    async function list(){
+      const raw=await storage.getItem(key);if(raw==null)return [];
+      let data;try{data=typeof raw==='string'?JSON.parse(raw):raw;}catch{throw invalid();}
+      if(data?.schema!==1||!Array.isArray(data.items))throw invalid();
+      const names=new Set();
+      return data.items.map(item=>{
+        if(!item||typeof item.name!=='string'||!item.name.trim()||item.name!==item.name.trim()||typeof item.prompt!=='string'||names.has(item.name))throw invalid();
+        names.add(item.name);return {name:item.name,prompt:item.prompt};
+      });
+    }
+    const write=items=>storage.setItem(key,JSON.stringify({schema:1,items}));
+    function findExpected(items,expected){
+      const index=items.findIndex(item=>item.name===expected?.name);
+      if(index<0||items[index].prompt!==expected.prompt)throw Error('선택한 프리셋이 변경되거나 삭제되었습니다. 설정창을 다시 열고 선택하세요.');
+      return index;
+    }
+    async function put(name,prompt,expected=null){
+      if(typeof name!=='string'||!name.trim())throw Error('프리셋 이름을 입력하세요.');
+      if(typeof prompt!=='string')throw Error('요약 지침은 문자열이어야 합니다.');
+      name=name.trim();const items=await list(),index=expected?findExpected(items,expected):-1;
+      if(items.some((item,i)=>item.name===name&&i!==index))throw Error('같은 이름의 프리셋이 있습니다. 다른 이름을 쓰거나 선택 프리셋 수정을 사용하세요.');
+      const item={name,prompt};
+      if(index<0)items.push(item);else items[index]=item;
+      await write(items);return item;
+    }
+    async function remove(expected){const items=await list(),index=findExpected(items,expected);items.splice(index,1);await write(items);}
+    return {list,put,remove};
+  }
   function create(storage,ns,{validVector,entryHash}){
     const chats=ns+'chat:',vectorPrefix=ns+'vectors:',recallPrefix=ns+'recall:';
     const vectorCache=new Map(),queries=new Map();
@@ -46,6 +78,6 @@ const ChronicleStorage=(()=>{
     return {vectors,saveVectors,recall,saveRecall,clearRecall,sync,copy,reset,derivedChats,
       query:chat=>queries.get(chat),saveQuery:(chat,value)=>keep(queries,chat,value),clearQuery:chat=>queries.delete(chat)};
   }
-  return {create};
+  return {create,createPromptPresets};
 })();
 if(typeof module!=='undefined'&&module.exports)module.exports=ChronicleStorage;

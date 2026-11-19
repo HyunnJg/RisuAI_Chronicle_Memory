@@ -5,12 +5,16 @@ const root=__dirname,version=require('./package.json').version;
 const header=`//@name RisuChronicleMemory
 //@api 3.0
 //@version ${version}
+//@update-url https://raw.githubusercontent.com/HyunnJg/RisuAI_Chronicle_Memory/main/Chronicle_Memory.js
+//@link https://github.com/HyunnJg/RisuAI_Chronicle_Memory GitHub
 //@display-name Chronicle Memory · 사건 로그
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 HyunnJg. See LICENSE; provided without warranty.
 // See README.md for installation and THIRD_PARTY_NOTICES.md for RPack attribution.
 `;
-fs.writeFileSync(path.join(root,`Chronicle_Memory_v${version}.js`),header+['core.cjs','providers.cjs','retrieval.cjs','storage.cjs','platform.cjs','runtime.js'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n'));
+const plugin=header+['core.cjs','providers.cjs','retrieval.cjs','storage.cjs','platform.cjs','lifecycle.cjs','runtime.js'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n');
+fs.writeFileSync(path.join(root,`Chronicle_Memory_v${version}.js`),plugin);
+fs.writeFileSync(path.join(root,'Chronicle_Memory.js'),plugin);
 const toggles=[
   'chronicle_ctl_group=📜 Chronicle Memory=group',
   'chronicle_ctl_intro=새 구간을 사건 기록 묶음(청크)으로 압축합니다. 단독·자체 하이브리드는 원문도 관리하고, Risu 기억 병행은 원문·과거 검색을 Risu에 맡깁니다. API·모델·지침은 플러그인에서 연결하세요.=caption',

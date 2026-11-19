@@ -5,27 +5,61 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');const vm=require('node:vm');const path=require('node:path');
 const C=require('../core.cjs');
 const P=require('../providers.cjs'),R=require('../retrieval.cjs'),S=require('../storage.cjs'),E=require('../platform.cjs');
+const L=require('../lifecycle.cjs');
 const chunk=rows=>({from:rows[0].turn,to:rows.at(-1).turn,title:'임무 기록',keywords:['정찰','보상'],events:[{date:'1073.05.03',time:'저녁',summary:'정찰 임무의 보상 조건을 합의함.'}]});
 function raw(n,pending=true){return Array.from({length:n},(_,i)=>[{role:'user',data:`입력${i+1}`,chatId:`u${i+1}`},{role:'char',data:`응답${i+1}`,chatId:`a${i+1}`}]).flat().concat(pending?[{role:'user',data:'다음',chatId:`u${n+1}`}]:[]);}
 function formatted(r){return [{role:'system',content:'규칙'},...r.map(m=>({role:m.role==='char'?'assistant':'user',content:m.data,memo:m.chatId}))];}
 async function setup(override={},change={}){
   const store=change.store||new Map([['risu-chronicle:v1:settings',JSON.stringify(C.settings({enabled:true,...override}))]]);
   const char={type:'character',chaId:'character-1',name:'테스트 캐릭터',chatPage:0,chats:[{id:'chat-1',name:'대화',message:raw(10)}]};
-  const hooks={},calls=[],writes=[];let registrations=0;
+  const hooks={},calls=[],writes=[];let registrations=0,startup=null;
+  const startupId=Symbol('startup timer');
   const api={pluginStorage:{getItem:async k=>store.get(k),setItem:async(k,v)=>{writes.push({key:k,value:v});store.set(k,v);},keys:async()=>[...store.keys()],removeItem:async k=>store.delete(k)},
     safeLocalStorage:{getItem:async key=>change.onCredential?change.onCredential(key,store):change.credentials?.[key]||null},getCurrentCharacterIndex:async()=>0,getCurrentChatIndex:async()=>char.chatPage,
     getCharacter:async()=>structuredClone(char),addRisuReplacer:async(name,fn)=>{hooks[name]=fn;},
     registerSetting:async(_name,fn)=>{registrations++;hooks.open=fn;},registerButton:async()=>{registrations++;},
+    onUnload:async fn=>{hooks.unload=fn;},
     runLLMModel:async opts=>{calls.push(opts);if(change.onCall) return change.onCall(opts,char);
       const data=JSON.parse(opts.messages[1].content);return {type:'success',result:JSON.stringify(chunk(data))};},
-    nativeFetch:async(url,opts)=>{calls.push({url,opts});if(change.onFetch)return change.onFetch(url,opts,char);return change.externalResponse || new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))}}]}),{status:200});}
+    nativeFetch:async(url,opts)=>{calls.push({url,opts});if(change.onFetch)return change.onFetch(url,opts,char);return change.externalResponse || new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))}}]}),{status:200});},
+    ...change.api
   };
-  const sandbox={risuai:api,ChronicleCore:C,ChronicleProviders:P,ChronicleRetrieval:R,ChronicleStorage:S,ChroniclePlatform:{...E,assertMemory:()=>E.assertMemory('environment'in change?change.environment:globalThis)},structuredClone,TextEncoder,crypto:globalThis.crypto,
-    setTimeout:change.timers?((fn,ms)=>{change.timers.push(ms);return setTimeout(fn,ms);}):setTimeout,clearTimeout,URL,Response,console,
+  const sandbox={risuai:api,ChronicleCore:C,ChronicleProviders:P,ChronicleRetrieval:R,ChronicleStorage:S,ChronicleLifecycle:L,ChroniclePlatform:{...E,assertMemory:()=>E.assertMemory('environment'in change?change.environment:globalThis)},structuredClone,TextEncoder,crypto:globalThis.crypto,
+    // Drive the one bootstrap timer explicitly; track model-operation deadlines separately.
+    setTimeout:(fn,ms)=>{if(ms===2500){startup=fn;return startupId;}if(change.timers)change.timers.push(ms);return setTimeout(fn,ms);},
+    clearTimeout:id=>{if(id===startupId)startup=null;else clearTimeout(id);},URL,Response,console,
     ...(change.document?{document:change.document}:{}),...(change.clock?{Date:change.clock}:{})};
   await vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../runtime.js'),'utf8'),sandbox);
-  return {store,char,hooks,calls,writes,registrations,getState:()=>JSON.parse(store.get('risu-chronicle:v1:chat:character-1:chat-1')||'null'),getRecall:()=>JSON.parse(store.get('risu-chronicle:v1:recall:character-1:chat-1')||'null'),getVectors:()=>JSON.parse(store.get('risu-chronicle:v1:vectors:character-1:chat-1')||'{"entries":{}}')};
+  const start=()=>{const fn=startup;startup=null;return fn?.();};
+  if(!change.deferStartup)await start();
+  return {store,char,hooks,calls,writes,registrations,start,getState:()=>JSON.parse(store.get('risu-chronicle:v1:chat:character-1:chat-1')||'null'),getRecall:()=>JSON.parse(store.get('risu-chronicle:v1:recall:character-1:chat-1')||'null'),getVectors:()=>JSON.parse(store.get('risu-chronicle:v1:vectors:character-1:chat-1')||'{"entries":{}}')};
 }
+test('settings and chat UI are available before the deferred host permission request',async()=>{
+  let attempts=0;const h=await setup({}, {deferStartup:true,api:{addRisuReplacer:async()=>{attempts++;}}});
+  assert.equal(h.registrations,2);assert.equal(typeof h.hooks.open,'function');assert.equal(attempts,0);
+  await h.start();assert.equal(attempts,1);
+});
+test('pending permission does not hold initialization or prevent UI registration',async()=>{
+  const gate=controlled();let requested=false;
+  const h=await setup({}, {deferStartup:true,api:{addRisuReplacer:async()=>{requested=true;await gate.promise;},requestPluginPermission:async()=>false}});
+  const registration=h.start();await new Promise(r=>setImmediate(r));
+  assert(requested);assert.equal(h.registrations,2);assert.equal(h.writes.length,0);
+  gate.resolve();await registration;assert.equal(h.hooks.beforeRequest,undefined);
+});
+test('unload cancels delayed registration and removes the same document listeners',async()=>{
+  const doc=waitDocument(),removed=[];doc.removeEventListener=(name,fn)=>{assert.equal(doc.listeners[name],fn);removed.push(name);delete doc.listeners[name];};
+  const h=await setup({}, {deferStartup:true,document:doc});await h.hooks.unload();await h.start();
+  assert.equal(h.hooks.beforeRequest,undefined);assert.deepEqual(removed,['click','visibilitychange']);
+});
+test('unload ignores late model success, does not write old state, and makes stale hooks pass through',async()=>{
+  const began=controlled(),reply=controlled();
+  const h=await setup({}, {onCall:async()=>{began.resolve();return reply.promise;}});
+  const input=formatted(h.char.chats[0].message),task=h.hooks.beforeRequest(input,'model');await began.promise;
+  await h.hooks.unload();await task;const writes=h.writes.length,state=JSON.stringify(h.getState());
+  reply.resolve({type:'success',result:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))});await new Promise(r=>setImmediate(r));
+  assert.equal(h.writes.length,writes);assert.equal(JSON.stringify(h.getState()),state);
+  assert.equal(await h.hooks.beforeRequest(input,'model'),input);assert.equal(h.calls.length,1);
+});
 test('plugin registers UI and main hook; auxiliary requests pass through',async()=>{
   const h=await setup();assert.equal(h.registrations,2);
   const input=formatted(raw(10));assert.equal(await h.hooks.beforeRequest(input,'memory'),input);assert.equal(h.calls.length,0);

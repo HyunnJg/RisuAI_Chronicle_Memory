@@ -8,6 +8,7 @@
   const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:', HEALTH=NS+'health';
   let serial=Promise.resolve(), lastStatus='준비됨', uiContext=null, uiState=null, failedUntil=new Map(), embeddingFailedUntil=new Map(),recoveringConfig=false;
   let activeOperation=null,lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,working=0;
+  let hookLifecycle=null,startupTimer=null,unloaded=false;
   const detachedRequests=new Map(),timeline=C.createTimelineReader();
   const exclusive=fn=>{
     const task=serial.then(async()=>{working++;try{return await fn();}finally{working--;renderHealth();}}); serial=task.catch(()=>{}); return task;
@@ -28,6 +29,7 @@
     notify('기다리기를 중단했습니다. 늦은 응답은 기록에 반영하지 않습니다. 서버 호출·과금의 취소는 보장하지 않으며, 이전 호출이 끝나기 전에는 이 채팅에서 새 기억 호출을 시작하지 않습니다.');
   }
   async function waitForModel(ctx,label,fn,range={}) {
+    if(unloaded)throw waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 호출을 시작하지 않습니다.');
     if(detachedRequests.has(ctx.key))throw waitError('CHRONICLE_WAIT_PENDING','중단한 이전 기억 호출이 아직 끝나지 않았습니다. 이번 요청은 미요약 원문을 유지하며 새 기억 호출을 생략합니다.');
     let stop;const stopped=new Promise((_,reject)=>stop=reject);
     // Register a handler immediately, including a stop during the status write.
@@ -50,6 +52,9 @@
   }
   function renderHealth() {
     if(typeof document==='undefined')return;
+    const hookState=hookLifecycle?.snapshot(),hookPanel=document.getElementById('hookStatus'),hookButton=document.getElementById('ensureHook');
+    if(hookPanel&&hookState){hookPanel.textContent=ChronicleLifecycle.describe(hookState);hookPanel.dataset.warning=hookState.phase==='confirmed'?'false':'true';}
+    if(hookButton&&hookState){hookButton.disabled=['pending','unloaded'].includes(hookState.phase);hookButton.textContent=hookState.phase==='confirmed'?'주입 훅 연결 확인됨':'주입 권한 확인·등록';}
     const button=document.getElementById('stopWait');
     if(button){button.hidden=!activeOperation;button.disabled=!activeOperation||activeOperation.stopped;}
     const panel=document.getElementById('health');if(!panel)return;
@@ -60,6 +65,7 @@
     panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!activeOperation&&!working)?'true':'false';
   }
   async function health(status,message) {
+    if(unloaded)return;
     lastHealth={status,message:redact(message),at:new Date().toISOString()};renderHealth();
     try{await save(HEALTH,lastHealth);}catch{/* Diagnostics must not block RP or overwrite narrative state. */}
   }
@@ -119,6 +125,7 @@
     return {...ctx,tl:await timeline(ctx.chat.message)};
   }
   async function persistState(ctx,state) {
+    if(unloaded)throw waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 기록을 저장하지 않습니다.');
     state=C.validateState(state);await D.sync(ctx.key,state);
     const next=C.stripDerivedState(state);
     next.cacheMeta={charId:ctx.charId,chatId:ctx.chatId,charName:ctx.charName,chatName:ctx.chatName,updatedAt:new Date().toISOString()};
@@ -271,6 +278,7 @@
   async function beforeRequest(messages,type) {
     if(type!=='model'||messages.some(m=>m.memo==='risu-chronicle-summary-v1'))return messages;
     return exclusive(async()=>{
+      if(unloaded)return messages;
       try{
         const global=await config(),base=await conversation(),s=C.chatSettings(global,base.chat);
         if(!s.enabled)return messages;
@@ -426,6 +434,9 @@
     $('keyState').textContent=draftSecrets[visibleProvider]?'인증정보 저장됨 · 이 기기에 유지':'인증정보 없음';
     $('embeddingSecret').value=draftEmbeddingSecrets[visibleEmbeddingProvider]||'';$('embeddingClearSecret').checked=false;
     notify('설정 저장 완료');
+    // Registration uses neither the memory queue nor uiBusy: an unanswered host prompt
+    // must not block settings, backups, or a current RP request.
+    if(hookLifecycle&&s.enabled)void requestHook();
   }
   function action(id,fn) {
     $(id).onclick=async()=>{
@@ -434,7 +445,7 @@
       if(id!=='confirmPromptDelete')clearPromptDelete();
       uiBusy=true;
       const controls=[...document.querySelectorAll('button,input,select,textarea')],previous=controls.map(b=>b.disabled);
-      controls.forEach(b=>{if(!['close','stopWait','cancelDelete','cancelPromptDelete'].includes(b.id))b.disabled=true;});
+      controls.forEach(b=>{if(!['close','stopWait','ensureHook','cancelDelete','cancelPromptDelete'].includes(b.id))b.disabled=true;});
       try{
         await exclusive(fn);
         if(lastHealth?.status==='running'&&!activeOperation)await health('ok','설정창의 기억 호출 작업을 완료했습니다.');
@@ -544,6 +555,10 @@
     if(uiBusy){renderHealth();return api.showContainer('fullscreen');}
     opening=open().finally(()=>opening=null);return opening;
   }
+  function requestHook() {
+    if(startupTimer!==null){clearTimeout(startupTimer);startupTimer=null;}
+    return hookLifecycle.ensure();
+  }
   async function open() {
     const s=await config(true);
     try{lastHealth=await read(HEALTH,null);}catch{lastHealth=null;}
@@ -564,12 +579,12 @@
       input[type=checkbox]{width:auto}textarea{display:block;resize:vertical;margin-top:6px}button{background:#a8dfcb;color:#10221c;border:0;border-radius:6px;padding:10px 15px;font-weight:700;cursor:pointer}
       button.secondary{background:#34475d;color:#edf5ff}button:disabled{opacity:.5;cursor:wait}.row{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
       [hidden]{display:none!important}#status{white-space:pre-wrap;padding:12px;background:#24384a;border-radius:6px;overflow-wrap:anywhere}small{color:#b5c6d9}summary{cursor:pointer}.chunkEditor{border-top:1px solid #456079;padding:14px 0}#effectiveSettings{display:block;white-space:pre-wrap;overflow-wrap:anywhere}
-      #environment,#health{white-space:pre-wrap;overflow-wrap:anywhere}#health{padding:12px;background:#203e35;border-left:4px solid #a8dfcb}#health[data-warning=true]{background:#493326;border-color:#f1b77c}
+      #environment,#health,#hookStatus{white-space:pre-wrap;overflow-wrap:anywhere}#health,#hookStatus{padding:12px;background:#203e35;border-left:4px solid #a8dfcb}#health[data-warning=true],#hookStatus[data-warning=true]{background:#493326;border-color:#f1b77c}
       .downloadLink{display:inline-block;min-height:44px;padding:10px 15px;background:#a8dfcb;color:#10221c;border-radius:6px;font-weight:700;text-decoration:underline}
       input,select,textarea{font-size:16px;min-width:0}button{min-height:44px}header>div{min-width:0}main,section{overflow-wrap:anywhere}
       @media(max-width:600px){main{padding:12px}section{padding:14px}header{flex-wrap:wrap;align-items:flex-start}h1{font-size:22px}.grid{grid-template-columns:minmax(0,1fr)}.row>button{max-width:100%}}`+'</style>';
-    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.8</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
-      <section><h2>실행 환경 · 최근 기억 처리</h2><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>중단하면 늦은 응답을 기록에 반영하지 않고 미요약 원문을 유지합니다. 서버 호출·과금 취소는 보장하지 않습니다. 이전 호출이 끝나기 전에는 같은 채팅에서 새 기억 호출을 시작하지 않습니다. 대기 중에도 이 설정창은 열 수 있습니다. 설정 저장·기록 수정·삭제는 진행 중인 작업이 끝난 뒤 처리하므로 필요하면 기다리기를 먼저 중단하세요.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다. Risu 저장소는 실제 디스크 반영이 지연될 수 있어 기록 완료 직후 앱을 강제 종료하면 최근 기록이 남지 않을 수 있습니다.</p><p>API 요청은 Risu의 네트워크 설정을 따릅니다. 웹 환경에서 프록시를 사용하면 요청 내용과 인증정보가 해당 프록시를 경유할 수 있습니다. 연결 오류는 Risu의 직접 호출·프록시 설정도 확인하세요.</p></details></section>
+    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.7.9</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
+      <section><h2>실행 환경 · 최근 기억 처리</h2><p id="hookStatus" role="status"></p><div class="row"><button id="ensureHook" class="secondary">주입 권한 확인·등록</button></div><small>이 상태는 이번 실행의 주입 훅 연결 여부입니다. 아래의 과거 기억 처리 기록과 별개이며, 훅 실행 확인은 요약·주입 자체의 성공을 뜻하지 않습니다. 권한 확인은 설정 저장·기억 호출 대기와 별도로 동작합니다.</small><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>중단하면 늦은 응답을 기록에 반영하지 않고 미요약 원문을 유지합니다. 서버 호출·과금 취소는 보장하지 않습니다. 이전 호출이 끝나기 전에는 같은 채팅에서 새 기억 호출을 시작하지 않습니다. 대기 중에도 이 설정창은 열 수 있습니다. 설정 저장·기록 수정·삭제는 진행 중인 작업이 끝난 뒤 처리하므로 필요하면 기다리기를 먼저 중단하세요.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다. Risu 저장소는 실제 디스크 반영이 지연될 수 있어 기록 완료 직후 앱을 강제 종료하면 최근 기록이 남지 않을 수 있습니다.</p><p>API 요청은 Risu의 네트워크 설정을 따릅니다. 웹 환경에서 프록시를 사용하면 요청 내용과 인증정보가 해당 프록시를 경유할 수 있습니다. 연결 오류는 Risu의 직접 호출·프록시 설정도 확인하세요.</p></details></section>
       <section><h2>이 기억은 어떻게 동작하나요?</h2><p>대화 원문을 설정한 턴 수만큼 묶어 짧은 사건 기록으로 바꾸고, 이전 사건 기록 전체와 최근 원문을 다음 RP 요청에 함께 보냅니다. 오래된 로그를 반복해서 다시 요약하지 않습니다.</p>
       <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다. <strong>원문 자르기 → 청크 커밋 시 이동</strong>을 선택하면 같은 조건에서 원문 T6~T12를 유지하고, 다음 T11~T15 청크가 저장되면 원문 T11~T15로 이동합니다.</p>
       <p><strong>Risu 기억 병행 · 하이파 주력</strong>은 원문 관리와 과거 검색을 Risu에 맡기고, 같은 주기로 만든 짧은 연대기를 덧붙입니다. 기본은 턴당 50글자 목표·누적 로그 전체 주입이며 최근 K청크·기록만도 선택할 수 있습니다. 기존 단독·자체 하이브리드 설정은 그대로 유지합니다.</p>
@@ -825,21 +840,38 @@
         await loadEditor();await loadCaches();notify(restored.changed?'원문과 일치하는 기억을 복원했습니다. 중복 보관함은 합쳤습니다.':'이미 같은 기억과 보관함입니다. 중복 저장하지 않았습니다.');
       });}catch(e){notify(e.message);}finally{$('importFile').value='';}
     };
+    $('ensureHook').onclick=()=>{void requestHook();};
     $('environment').textContent=E.description();renderHealth();
     clearDelete();await refreshEditor(true);try{await loadCaches();}catch(e){notify(P.safeError(e));}
     clearPromptDelete();try{await refreshPromptPresets();}catch(e){$('promptPresetCount').textContent='프리셋 읽기 실패 · 저장 데이터는 유지합니다.';notify(e.message);}
     await api.showContainer('fullscreen');
   }
-  await api.addRisuReplacer('beforeRequest',beforeRequest);
+  hookLifecycle=ChronicleLifecycle.create(api,beforeRequest,{onChange:renderHealth,safeError:redact});
+  // Expose the UI before any host permission prompt can stall or disappear.
   await api.registerSetting('Chronicle Memory',openSettings,'📜','html');
   await api.registerButton({name:'Chronicle Memory',icon:'📜',iconType:'html',location:'chat'},openSettings);
-  if(typeof document!=='undefined'&&typeof document.addEventListener==='function'){
-    document.addEventListener('click',event=>{if(event.target?.id==='stopWait')stopWaiting();});
-    document.addEventListener('visibilitychange',()=>{
+  const onClick=event=>{if(event.target?.id==='stopWait')stopWaiting();};
+  const onVisibility=()=>{
     if(document.visibilityState!=='hidden'){
       renderHealth();
       if(activeOperation&&document.getElementById('status'))notify(`${activeOperation.label} 응답을 기다리고 있습니다. 기다리기 중단을 선택할 수 있으며 자동으로 중복 재시도하지 않습니다.`);
     }
-    });
+  };
+  if(typeof document!=='undefined'&&typeof document.addEventListener==='function'){
+    document.addEventListener('click',onClick);
+    document.addEventListener('visibilitychange',onVisibility);
   }
+  if(typeof api.onUnload==='function')await api.onUnload(async()=>{
+    unloaded=true;
+    if(startupTimer!==null){clearTimeout(startupTimer);startupTimer=null;}
+    if(activeOperation){activeOperation.stopped=true;activeOperation.stop(waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 호출 결과를 반영하지 않습니다.'));}
+    if(typeof document!=='undefined'&&typeof document.removeEventListener==='function'){
+      document.removeEventListener('click',onClick);document.removeEventListener('visibilitychange',onVisibility);
+    }
+    E.releaseBackup(preparedBackup);preparedBackup=null;
+    await hookLifecycle.dispose();
+  });
+  // Best-effort startup collision reduction, not proof that the host has finished loading.
+  // Always register: a card/Control module may enable memory while the global default is off.
+  startupTimer=setTimeout(()=>{startupTimer=null;return hookLifecycle.ensure();},2500);
 })();

@@ -13,7 +13,8 @@ const files=[
  '.gitignore','.github/ISSUE_TEMPLATE/bug_report.md','.github/workflows/release.yml',
  'Chronicle_Memory.js',`Chronicle_Memory_v${version}.js`,`Chronicle_Control_v${version}.charx`,
  `Chronicle_Control_v${version}.risum`,`Chronicle_Control_v${version}.module.json`,
- ...['core','embeddings','providers','retrieval','runtime','storage','platform','lifecycle','ui'].map(name=>`tests/${name}.test.cjs`)
+ ...['core','embeddings','providers','retrieval','runtime','storage','platform','lifecycle','ui'].map(name=>`tests/${name}.test.cjs`),
+ 'tests/fixtures/summary_prompt_v0.7.9.json','tests/fixtures/upgrade_v0.7.9.json','bench/before_request.cjs'
 ];
 function crc32(buf){let value=0xffffffff;for(const b of buf){value^=b;for(let bit=0;bit<8;bit++)value=(value>>>1)^((value&1)?0xedb88320:0);}return (value^0xffffffff)>>>0;}
 function zip(files){

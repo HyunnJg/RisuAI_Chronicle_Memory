@@ -349,6 +349,27 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
       hash:batch.at(-1).hash,contentHash:batch.at(-1).contentHash,...(typeof text==='string'?{text}:{title:text.title,keywords:text.keywords,text:text.text}),createdAt:new Date().toISOString(),editedAt:null});
     next.revision++; next.lastError='';next.summaryWarnings=typeof text==='string'?[]:text.warnings||[]; return next;
   }
+  // A user-requested re-summary is allowed only while every source turn of the chunk is
+  // still present and unchanged (the chained hash at `to` covers all earlier turns).
+  function resummarizable(state,id,tl){
+    const index=state.entries.findIndex(e=>e.id===id);
+    if(index<0)return {ok:false,index,reason:'청크를 찾을 수 없습니다. 현재 대화를 다시 불러오세요.'};
+    const entry=state.entries[index],batch=tl.turns.slice(entry.from-1,entry.to);
+    if(batch.length!==entry.to-entry.from+1)return {ok:false,index,entry,reason:'이 청크의 원문 턴이 현재 대화에 없어 다시 요약할 수 없습니다.'};
+    if(batch.at(-1).hash!==entry.hash)return {ok:false,index,entry,reason:'원문이 저장 당시와 달라 다시 요약할 수 없습니다. 현재 대화를 다시 불러오세요.'};
+    return {ok:true,index,entry,batch,reason:''};
+  }
+  // Replaces exactly one chunk and archives the previous version; later chunks are untouched.
+  function replaceEntry(state,id,batch,text){
+    const next=structuredClone(state),index=next.entries.findIndex(e=>e.id===id),old=next.entries[index];
+    if(!old||!batch.length||old.from!==batch[0].number||old.to!==batch.at(-1).number||old.hash!==batch.at(-1).hash)throw Error('다시 요약할 구간이 저장 기록과 일치하지 않습니다. 기존 청크를 유지합니다.');
+    const at=new Date().toISOString();
+    next.archive.push({at,reason:'사용자 재요약',entries:[old]});
+    next.entries[index]={id:globalThis.crypto.randomUUID(),from:old.from,to:old.to,hash:batch.at(-1).hash,contentHash:batch.at(-1).contentHash,
+      title:text.title,keywords:text.keywords,text:text.text,createdAt:at,editedAt:null,resummarizedAt:at};
+    delete next.lastRecall;next.revision++;next.summaryWarnings=text.warnings||[];
+    return next;
+  }
   const MARK='risu-chronicle-memory-v1';
   function compatiblePrefix(source,tl) {
     const valid=validateState(source),next=emptyState();
@@ -415,7 +436,7 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;
 
@@ -1005,7 +1026,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
   if (!api) throw Error('RisuAI API 3.0이 필요합니다.');
   const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:', HEALTH=NS+'health';
   let serial=Promise.resolve(), lastStatus='준비됨', uiContext=null, uiState=null, failedUntil=new Map(), embeddingFailedUntil=new Map(),recoveringConfig=false;
-  let activeOperation=null,lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,working=0;
+  let activeOperation=null,lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,pendingResummarize=null,working=0;
   let hookLifecycle=null,startupTimer=null,unloaded=false;
   const detachedRequests=new Map(),timeline=C.createTimelineReader();
   const exclusive=fn=>{
@@ -1273,6 +1294,32 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     try{if(dirty)await D.saveVectors(ctx.key,index);await D.saveRecall(ctx.key,info);}catch(e){warnings.push('검색 캐시 저장 실패: '+P.safeError(e)+'. 요약 기록은 유지합니다.');}
     return {text:selected.text,warnings,info};
   }
+  // User-requested re-summary of one saved chunk. The target (chat key, chunk id, range,
+  // hash, revision) is fixed when the confirmation opens; any change discards the result.
+  async function resummarize(target) {
+    const ctx=await context();
+    if(ctx.key!==target.key)throw Error('대화가 바뀌었습니다. 다시 요약하지 않았습니다. 현재 대화를 다시 불러오세요.');
+    const cfg=C.chatSettings(await config(),ctx.chat),state=C.reconcile(await stateFor(ctx),ctx.tl);
+    if(!cfg.enabled)throw Error('이 대화에서는 기억 사용이 꺼져 있어 다시 요약하지 않았습니다.');
+    if(state.revision!==target.revision)throw Error('기억이 변경되었습니다. 현재 대화를 다시 불러온 뒤 다시 시도하세요.');
+    const check=C.resummarizable(state,target.id,ctx.tl);
+    if(!check.ok)throw Error(check.reason);
+    if(check.entry.from!==target.from||check.entry.to!==target.to||check.entry.hash!==target.hash)throw Error('선택한 청크가 변경되었습니다. 현재 대화를 다시 불러오세요.');
+    const label=`T${target.from}~T${target.to} 다시 요약`;
+    try{
+      const result=await waitForModel(ctx,label,transport=>summarize(check.batch,cfg,{...ctx,previous:state.entries[check.index-1]},transport),{from:target.from,to:target.to});
+      await unchanged(ctx);
+      const latest=C.reconcile(await stateFor(ctx),ctx.tl);
+      if(latest.revision!==state.revision)throw Error('다시 요약하는 동안 기억이 변경되어 결과를 저장하지 않았습니다.');
+      const next=C.replaceEntry(latest,target.id,check.batch,result.text);next.lastSummaryInput=result.stats;
+      await D.clearRecall(ctx.key);await persistState(ctx,next);
+      lastStatus=`${label} 완료 · 이전 청크는 보관함에 남겼습니다.${cfg.mode==='hybrid'?' 다음 하이브리드 요청에서 새 청크만 다시 색인합니다.':''}`;
+      await health('ok',lastStatus);return next;
+    }catch(e){
+      await health(e.code==='CHRONICLE_WAIT_STOPPED'||e.code==='CHRONICLE_WAIT_PENDING'?'skipped':'warning',`${label} 실패 · 기존 청크를 그대로 유지합니다. `+P.safeError(e));
+      throw Error(`${label} 실패 · 기존 청크를 그대로 유지합니다. `+redact(e));
+    }
+  }
   async function beforeRequest(messages,type) {
     if(type!=='model'||messages.some(m=>m.memo==='risu-chronicle-summary-v1'))return messages;
     return exclusive(async()=>{
@@ -1441,9 +1488,10 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       if(uiBusy)return;
       if(id!=='confirmDelete')clearDelete();
       if(id!=='confirmPromptDelete')clearPromptDelete();
+      if(id!=='confirmResummarize')clearResummarize();
       uiBusy=true;
       const controls=[...document.querySelectorAll('button,input,select,textarea')],previous=controls.map(b=>b.disabled);
-      controls.forEach(b=>{if(!['close','stopWait','ensureHook','cancelDelete','cancelPromptDelete'].includes(b.id))b.disabled=true;});
+      controls.forEach(b=>{if(!['close','stopWait','ensureHook','cancelDelete','cancelPromptDelete','cancelResummarize'].includes(b.id))b.disabled=true;});
       try{
         await exclusive(fn);
         if(lastHealth?.status==='running'&&!activeOperation)await health('ok','설정창의 기억 호출 작업을 완료했습니다.');
@@ -1464,7 +1512,13 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     $('entries').replaceChildren();
     for(const e of state.entries) {
       const group=document.createElement('div');group.className='chunkEditor';
-      const heading=document.createElement('strong');heading.textContent=`${e.from}–${e.to}턴${e.editedAt?' · 수동 수정됨':''}`;group.appendChild(heading);
+      const heading=document.createElement('strong');heading.textContent=`${e.from}–${e.to}턴${e.editedAt?' · 수동 수정됨':e.resummarizedAt?' · 다시 요약됨':''}`;group.appendChild(heading);
+      const check=C.resummarizable(state,e.id,ctx.tl),redo=document.createElement('button');
+      redo.className='secondary';redo.textContent='이 청크만 다시 요약';redo.dataset.resummarizeId=e.id;redo.disabled=!check.ok;
+      redo.onclick=()=>{if(!uiBusy)askResummarize(e.id);};
+      const redoHelp=document.createElement('small');redoHelp.dataset.resummarizeReason=e.id;
+      redoHelp.textContent=check.ok?' 요약 API 호출 비용 발생 · 이전 버전은 보관함에 남습니다.':' '+check.reason;
+      const redoRow=document.createElement('div');redoRow.className='row';redoRow.appendChild(redo);redoRow.appendChild(redoHelp);group.appendChild(redoRow);
       const titleLabel=document.createElement('label');titleLabel.textContent='청크 제목';
       const title=document.createElement('input');title.dataset.titleId=e.id;title.value=e.title||'';titleLabel.appendChild(title);group.appendChild(titleLabel);
       const keywordLabel=document.createElement('label');keywordLabel.textContent='검색 키워드 · 쉼표로 구분';
@@ -1547,6 +1601,29 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     $('deleteTarget').textContent=label+` · ${keys.length}개 채팅 기록`;
     $('deleteConfirmation').hidden=false;$('deleteConfirmation').focus();
     notify('삭제 대상을 확인한 뒤 삭제 확인 또는 취소를 누르세요.');
+  }
+  function clearResummarize() {
+    pendingResummarize=null;
+    if(typeof document!=='undefined'&&$('resummarizeConfirmation'))$('resummarizeConfirmation').hidden=true;
+  }
+  function editorDirty() {
+    if(!uiState)return false;
+    const find=id=>uiState.entries.find(v=>v.id===id);
+    return [...document.querySelectorAll('[data-entry-id]')].some(a=>find(a.dataset.entryId)?.text!==a.value)||
+      [...document.querySelectorAll('[data-title-id]')].some(i=>(find(i.dataset.titleId)?.title||'')!==i.value.trim())||
+      [...document.querySelectorAll('[data-keywords-id]')].some(i=>JSON.stringify(find(i.dataset.keywordsId)?.keywords||[])!==JSON.stringify([...new Set(i.value.split(/[,，]/).map(v=>v.trim()).filter(Boolean))]));
+  }
+  function askResummarize(id) {
+    clearDelete();clearPromptDelete();
+    const entry=uiState?.entries.find(e=>e.id===id);
+    if(!uiContext||!entry){notify('먼저 현재 대화 불러오기를 누르세요.');return;}
+    if(editorDirty()){notify('저장하지 않은 로그 수정이 있습니다. 수정한 로그 저장 또는 현재 대화 불러오기 후 다시 요약하세요.');return;}
+    const check=C.resummarizable(uiState,id,uiContext.tl);
+    if(!check.ok){notify(check.reason);return;}
+    pendingResummarize={key:uiContext.key,id,from:entry.from,to:entry.to,hash:entry.hash,revision:uiState.revision};
+    $('resummarizeTarget').textContent=`${uiContext.charName} / ${uiContext.chatName||'대화'} · ${entry.from}–${entry.to}턴 · ${entry.title||'사건 기록'}`;
+    $('resummarizeConfirmation').hidden=false;$('resummarizeConfirmation').focus();
+    notify('다시 요약할 청크를 확인한 뒤 실행 또는 취소를 누르세요.');
   }
   function openSettings() {
     if(opening)return opening;
@@ -1658,7 +1735,8 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       <div class="row"><button id="saveEmbeddingSettings">전체 설정 저장</button><button id="testEmbedding" class="secondary">임베딩 연결 시험</button><button id="previewRecall" class="secondary">현재 대화 검색 시험</button><button id="resetEmbeddings" class="secondary">활성 청크 벡터 초기화</button></div>
       <p>연결·검색 시험은 API 호출 비용이 발생할 수 있습니다. 인증정보는 이 기기에만 보관하고 백업에서 제외합니다. 벡터는 요약과 분리한 검색 캐시에 보관하며 변경할 때만 저장합니다. 질의 벡터는 실행 중 메모리에만 두고, 기억 삭제 시 해당 검색 캐시도 함께 지웁니다.</p></section>
       <section><h2>현재 대화의 기억</h2><p id="chatTitle"></p><div class="row"><button id="reload" class="secondary">현재 대화 불러오기</button><button id="generate">미처리 구간 요약</button><button id="saveLog">수정한 로그 저장</button></div>
-      <p>자동 처리는 새 구간을 덧붙입니다. 원문이 달라진 구간은 보관함으로 이동하며 RP에는 주입하지 않습니다.</p><div id="entries"></div>
+      <p>자동 처리는 새 구간을 덧붙입니다. 원문이 달라진 구간은 보관함으로 이동하며 RP에는 주입하지 않습니다. ‘이 청크만 다시 요약’은 직접 누를 때만 실행하며 자동으로 다시 요약하지 않습니다.</p>
+      <section id="resummarizeConfirmation" hidden tabindex="-1" aria-labelledby="resummarizeTitle"><h2 id="resummarizeTitle">청크 다시 요약 확인</h2><p id="resummarizeTarget"></p><p>저장된 현재 설정(요약 모델·추가 지침·직전 청크 참고)으로 이 구간만 다시 요약합니다. <strong>요약 API 호출 비용이 발생합니다.</strong> 뒤의 청크는 다시 요약하지 않으며, 바뀌기 전 청크는 보관함에 ‘사용자 재요약’으로 남습니다. 실패·중단하면 기존 청크를 그대로 둡니다. 설정창에서 바꾸고 저장하지 않은 설정은 반영하지 않습니다.</p><div class="row"><button id="confirmResummarize">다시 요약 실행</button><button id="cancelResummarize" class="secondary">취소</button></div></section><div id="entries"></div>
       <div class="row"><button id="export" class="secondary">현재 대화 JSON 백업</button><button id="importButton" class="secondary">JSON 복원</button><input id="importFile" type="file" accept="application/json,.json" hidden></div>
       <div id="backupReady" hidden><p>백업 준비 완료 · 아래 링크를 직접 눌러 저장하세요. 파일 저장이 안 되면 JSON 전체를 복사해 별도로 보관할 수 있습니다.</p><div class="row"><a id="backupDownload" class="downloadLink" download="Chronicle_Memory_Backup.json" hidden>JSON 파일 저장</a><button id="selectBackup" class="secondary">JSON 전체 선택</button></div><textarea id="backupText" rows="8" readonly aria-label="백업 JSON 전체"></textarea><small>선택한 JSON에는 대화의 요약 기록이 들어 있습니다. 파일 앱에서 저장 결과를 확인하세요.</small></div>
       <p>복원 시 현재 원문과 맞는 구간만 활성화합니다. 기존 기억은 보관함에 남습니다. API 키·벡터·검색 결과는 백업하지 않으며 필요하면 다시 색인합니다.</p></section>
@@ -1736,7 +1814,14 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       notify('연결 성공 · 모델에서 텍스트 응답을 받았습니다.');
     });
     $('cancelDelete').onclick=clearDelete;
-    $('close').onclick=()=>{clearDelete();clearPromptDelete();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
+    $('cancelResummarize').onclick=clearResummarize;
+    action('confirmResummarize',async()=>{
+      const target=pendingResummarize;clearResummarize();if(!target)throw Error('다시 요약할 청크를 다시 선택하세요.');
+      notify(`T${target.from}~T${target.to}을 다시 요약하고 있습니다…`);
+      try{await resummarize(target);}finally{try{await loadEditor();await loadCaches();}catch{}}
+      notify(lastStatus);
+    });
+    $('close').onclick=()=>{clearDelete();clearPromptDelete();clearResummarize();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
     $('selectBackup').onclick=()=>{$('backupText').focus();$('backupText').select();$('backupText').setSelectionRange(0,$('backupText').value.length);notify('JSON 전체를 선택했습니다. 기기의 복사 기능으로 보관하세요.');};
     action('saveSettings',saveSettings);
     action('saveEmbeddingSettings',saveSettings);

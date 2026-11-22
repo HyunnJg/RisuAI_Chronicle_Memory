@@ -340,6 +340,27 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
       hash:batch.at(-1).hash,contentHash:batch.at(-1).contentHash,...(typeof text==='string'?{text}:{title:text.title,keywords:text.keywords,text:text.text}),createdAt:new Date().toISOString(),editedAt:null});
     next.revision++; next.lastError='';next.summaryWarnings=typeof text==='string'?[]:text.warnings||[]; return next;
   }
+  // A user-requested re-summary is allowed only while every source turn of the chunk is
+  // still present and unchanged (the chained hash at `to` covers all earlier turns).
+  function resummarizable(state,id,tl){
+    const index=state.entries.findIndex(e=>e.id===id);
+    if(index<0)return {ok:false,index,reason:'청크를 찾을 수 없습니다. 현재 대화를 다시 불러오세요.'};
+    const entry=state.entries[index],batch=tl.turns.slice(entry.from-1,entry.to);
+    if(batch.length!==entry.to-entry.from+1)return {ok:false,index,entry,reason:'이 청크의 원문 턴이 현재 대화에 없어 다시 요약할 수 없습니다.'};
+    if(batch.at(-1).hash!==entry.hash)return {ok:false,index,entry,reason:'원문이 저장 당시와 달라 다시 요약할 수 없습니다. 현재 대화를 다시 불러오세요.'};
+    return {ok:true,index,entry,batch,reason:''};
+  }
+  // Replaces exactly one chunk and archives the previous version; later chunks are untouched.
+  function replaceEntry(state,id,batch,text){
+    const next=structuredClone(state),index=next.entries.findIndex(e=>e.id===id),old=next.entries[index];
+    if(!old||!batch.length||old.from!==batch[0].number||old.to!==batch.at(-1).number||old.hash!==batch.at(-1).hash)throw Error('다시 요약할 구간이 저장 기록과 일치하지 않습니다. 기존 청크를 유지합니다.');
+    const at=new Date().toISOString();
+    next.archive.push({at,reason:'사용자 재요약',entries:[old]});
+    next.entries[index]={id:globalThis.crypto.randomUUID(),from:old.from,to:old.to,hash:batch.at(-1).hash,contentHash:batch.at(-1).contentHash,
+      title:text.title,keywords:text.keywords,text:text.text,createdAt:at,editedAt:null,resummarizedAt:at};
+    delete next.lastRecall;next.revision++;next.summaryWarnings=text.warnings||[];
+    return next;
+  }
   const MARK='risu-chronicle-memory-v1';
   function compatiblePrefix(source,tl) {
     const valid=validateState(source),next=emptyState();
@@ -406,6 +427,6 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;

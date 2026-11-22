@@ -471,3 +471,17 @@ test('v0.8.0 summary prompt carries only a small escaped reference to the saved 
   // A previous entry that is not directly adjacent is never sent.
   assert.equal(C.summaryPrompt(fixture.batch,C.settings({}),{charName:'리아',previous:{...previous,to:4}})[1].content,fixture.messages[1].content);
 });
+test('v0.8.0 resummarizable requires present, unchanged source turns and replaceEntry archives one chunk',async()=>{
+  const tl=await C.timeline(raw(10));
+  let state=C.commit(C.emptyState(),tl.turns.slice(0,5),'첫 기록');state=C.commit(state,tl.turns.slice(5,10),'둘째 기록');
+  const [a,b]=state.entries;
+  assert.equal(C.resummarizable(state,a.id,tl).ok,true);assert.equal(C.resummarizable(state,'none',tl).ok,false);
+  const edited=raw(10);edited[2].data='바뀐 사용자 2';const changed=await C.timeline(edited);
+  const mismatch=C.resummarizable(state,a.id,changed);assert.equal(mismatch.ok,false);assert.match(mismatch.reason,/원문이 저장 당시와 달라/);
+  const shorter=await C.timeline(raw(8));const missing=C.resummarizable(state,b.id,shorter);assert.equal(missing.ok,false);assert.match(missing.reason,/원문 턴이 현재 대화에 없어/);
+  const next=C.replaceEntry(state,a.id,tl.turns.slice(0,5),{title:'새 제목',keywords:['k'],text:'새 기록',warnings:['w']});
+  assert.equal(next.entries[0].text,'새 기록');assert.notEqual(next.entries[0].id,a.id);assert.deepEqual(next.entries[1],b);
+  assert.equal(next.archive.at(-1).reason,'사용자 재요약');assert.deepEqual(next.archive.at(-1).entries,[a]);assert.equal(next.revision,state.revision+1);
+  assert.doesNotThrow(()=>C.validateState(next));assert.equal(state.entries[0].text,'첫 기록');
+  assert.throws(()=>C.replaceEntry(state,a.id,tl.turns.slice(0,4),{title:'',keywords:[],text:'x'}),/일치하지 않습니다/);
+});

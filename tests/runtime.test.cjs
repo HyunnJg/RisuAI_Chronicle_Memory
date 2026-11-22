@@ -625,3 +625,16 @@ test('v0.8.0 the next summary references the saved, user-edited previous chunk r
   await off.hooks.beforeRequest(formatted(off.char.chats[0].message),'model');
   assert(Array.isArray(JSON.parse(off.calls[1].messages[1].content)));
 });
+test('v0.8.0 after a user re-summary only the replacement chunk is embedded again',async()=>{
+  const h=await setup({...hybridConfig,batchesPerRequest:2},{onFetch:async(url,opts)=>embeddingResponse(opts)}),key='risu-chronicle:v1:chat:character-1:chat-1';
+  h.char.chats[0].message=raw(15);await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.equal(C.covered(h.getState()),15);const indexed=Object.keys(h.getVectors().entries);assert.equal(indexed.length,3);
+  const state=h.getState(),tl=await C.timeline(h.char.chats[0].message),old=state.entries[1];
+  h.store.set(key,JSON.stringify(C.replaceEntry(state,old.id,tl.turns.slice(5,10),{title:'다시 쓴 구간',keywords:['재요약'],text:'새 기록',warnings:[]})));
+  const before=h.calls.filter(c=>c.url).length;
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  const documents=h.calls.filter(c=>c.url).slice(before).map(c=>JSON.parse(c.opts.body).input).filter(input=>!input[0].startsWith('사용자:')&&!input[0].startsWith('최근 상황:'));
+  assert.deepEqual(documents.map(d=>d.length),[1]);assert.match(documents[0][0],/새 기록/);
+  const vectors=h.getVectors().entries;assert(!(old.id in vectors));assert.equal(Object.keys(vectors).length,3);
+});

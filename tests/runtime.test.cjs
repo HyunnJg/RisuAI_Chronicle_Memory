@@ -783,3 +783,24 @@ test('v0.8.0 a background commit re-reads the latest state and keeps a log edit 
   const state=h.getState();assert.equal(state.entries[0].text,'사용자 수정본');assert.equal(state.revision,edited.revision+1);
   assert.deepEqual(state.entries.map(e=>[e.from,e.to]),[[1,5],[6,10]]);
 });
+for(const first of ['summary','embedding'])test(`stopping concurrent same-chat calls keeps the chat blocked until BOTH settle (${first} first)`,async()=>{
+  let now=Date.now();class Clock extends Date{static now(){return now;}}
+  const doc=waitDocument(),summaries=[],embeddings=[];
+  const h=await setup({mode:'hybrid',summaryBlocking:'nonblocking',embeddingProvider:'openai',embeddingModel:'test-embedding',embeddingReuseCredential:false},
+    {clock:Clock,document:doc,credentials:{'risu-chronicle:v1:embedding-credential:openai':'synthetic-key'},
+      onCall:async opts=>{const gate=controlled();summaries.push(gate);await gate.promise;return replyFor(opts);},
+      onFetch:async()=>{const gate=controlled();embeddings.push(gate);await gate.promise;return new Response(JSON.stringify({data:[{index:0,embedding:[1,0]}]}));}});
+  const key='risu-chronicle:v1:chat:character-1:chat-1',tl=await C.timeline(raw(5));
+  h.store.set(key,JSON.stringify(C.commit(C.emptyState(),tl.turns.slice(0,5),'기존 청크')));h.char.chats[0].message=raw(12);
+  const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  await until(()=>summaries.length===1&&embeddings.length===1,'both model calls started');
+  doc.listeners.click({target:{id:'stopWait'}});await task;await settle();
+  const one=first==='summary'?summaries[0]:embeddings[0],two=first==='summary'?embeddings[0]:summaries[0];
+  one.resolve();await settle();now+=61001;
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await settle();
+  assert.equal(summaries.length,1);assert.equal(embeddings.length,1);assert.equal(C.covered(h.getState()),5);
+  two.resolve();await settle();now+=61001;
+  const settings=JSON.parse(h.store.get('risu-chronicle:v1:settings'));settings.embeddingModel='';h.store.set('risu-chronicle:v1:settings',JSON.stringify(settings));
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await until(()=>summaries.length===2,'retry only after both settled');
+  summaries[1].resolve();await until(()=>C.covered(h.getState())===10,'retry committed');await h.hooks.unload();
+});

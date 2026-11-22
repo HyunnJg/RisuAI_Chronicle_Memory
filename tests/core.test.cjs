@@ -126,7 +126,7 @@ test('timeline cache compares full contents and matches uncached hashes through 
   branch.at(-1).data='다른 현재 입력';await same(branch);
 });
 test('unchanged prefixes reuse SHA-256 results but an equal-length early edit rebuilds both chains',async()=>{
-  let hashes=0;const sandbox={module:{exports:{}},TextEncoder,crypto:{subtle:{digest:(...args)=>{hashes++;return crypto.subtle.digest(...args);}}}};
+  let hashes=0;const sandbox={ChronicleRegexEngine:require('../vendor/re2js.js').RE2JS,module:{exports:{}},TextEncoder,crypto:{subtle:{digest:(...args)=>{hashes++;return crypto.subtle.digest(...args);}}}};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../core.cjs'),'utf8'),sandbox);
   const cached=sandbox.module.exports,reader=cached.createTimelineReader(),source=raw(5);
   await reader(source);assert.equal(hashes,11);
@@ -544,4 +544,15 @@ test('v0.8.0 reads v0.7.9 settings, state and backups and renders the same memor
   const chat={scriptstate:{$chronicle_enabled:'1',$chronicle_interval:'5',$chronicle_mode:'hybrid',$chronicle_risu_scope:'inherit',$chronicle_budget:'inherit',$chronicle_timeout:'inherit'}};
   const resolved=C.chatSettings({...old.settings,hybridLogScope:'recent',summaryBlocking:'nonblocking'},chat);
   assert.equal(resolved.hybridLogScope,'recent');assert.equal(resolved.summaryBlocking,'nonblocking');assert.deepEqual(resolved.settingWarnings,[]);
+});
+test('user removal rules execute in the pinned RE2 engine, including ambiguous repetitions',()=>{
+  const {spawnSync}=require('node:child_process');
+  const code=`const C=require('./core.cjs');const rules=C.settings({inputFilters:[{pattern:'(a|aa)+$',flags:'g',enabled:true}]}).inputFilters;const text='a'.repeat(10000)+'!';if(C.applyFilters(text,rules)!==text)process.exit(2);`;
+  const result=spawnSync(process.execPath,['-e',code],{cwd:path.join(__dirname,'..'),timeout:3000,encoding:'utf8'});
+  assert.ifError(result.error);assert.equal(result.status,0,result.stderr);
+  assert.equal(C.applyFilters('A1 A2',[{pattern:'a\\d',flags:'gi',enabled:true}]),' ');
+  assert.equal(C.applyFilters('A1 A2',[{pattern:'a\\d',flags:'i',enabled:true}]),' A2');
+  assert.equal(C.applyFilters('甲🙂乙',[{pattern:'🙂',flags:'gu',enabled:true}]),'甲乙');
+  for(const pattern of ['(?=a)','(a)\\1'])assert.throws(()=>C.settings({inputFilters:[{pattern,flags:'g'}]}),/RE2/);
+  for(const flags of ['y','v','d'])assert.throws(()=>C.settings({inputFilters:[{pattern:'a',flags}]}),/플래그/);
 });

@@ -5,7 +5,9 @@ const {test}=require('node:test'),assert=require('node:assert/strict'),vm=requir
 function documentMock() {
   const ids=new Map(),all=[],listeners=new Map();
   class Element {
-    constructor(tag='div'){this.tagName=tag;this.value='';this.checked=false;this.disabled=false;this.hidden=false;this.dataset={};this.textContent='';this.children=[];all.push(this);}
+    constructor(tag='div'){this.tagName=tag;this.value='';this.checked=false;this.disabled=false;this.hidden=false;this.open=false;this.attributes={};this.dataset={};this.textContent='';this.children=[];all.push(this);}
+    setAttribute(key,value){this.attributes[key]=String(value);}
+    getAttribute(key){return this.attributes[key]??null;}
     appendChild(child){this.children.push(child);return child;}
     replaceChildren(...children){
       // Detach replaced subtrees so selectors only see the rendered document, as a browser does.
@@ -165,4 +167,16 @@ test('v0.8.0 settings reject invalid removal patterns, preview removals, and war
 test('v0.8.0 settings screen shows the package version',async()=>{
   const h=await setup();await h.open();
   assert.match(fs.readFileSync(path.join(__dirname,'../Chronicle_Memory.js'),'utf8'),new RegExp(`<small>v${require('../package.json').version.replace(/\./g,'\\.')}</small>`));
+});
+test('settings tabs keep unsaved fields and support keyboard navigation while chunks start collapsed',async()=>{
+  const h=await setup('denied',{prepare:twoChunks});await h.open();
+  assert.equal(h.get('panel-basic').hidden,false);assert.equal(h.get('panel-advanced').hidden,true);
+  h.get('customPrompt').value='저장 전 지침';await h.click('tab-advanced');
+  assert.equal(h.get('panel-basic').hidden,true);assert.equal(h.get('panel-advanced').hidden,false);
+  assert.equal(h.get('tab-advanced').getAttribute('aria-selected'),'true');
+  let prevented=false;h.get('tab-advanced').onkeydown({key:'ArrowRight',preventDefault(){prevented=true;}});
+  assert(prevented);assert.equal(h.get('panel-memory').hidden,false);assert.equal(h.get('panel-advanced').hidden,true);
+  const chunks=h.all.filter(e=>e.dataset.chunkId);assert.equal(chunks.length,2);assert(chunks.every(e=>e.tagName==='details'&&!e.open));
+  await h.click('tab-basic');assert.equal(h.get('customPrompt').value,'저장 전 지침');
+  assert.match(h.doc.head.innerHTML,/position:sticky/);assert.match(h.doc.head.innerHTML,/prefers-reduced-motion|transition/);
 });

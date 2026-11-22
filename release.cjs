@@ -9,7 +9,7 @@ const files=[
  'core.cjs','providers.cjs','retrieval.cjs','storage.cjs','platform.cjs','lifecycle.cjs','runtime.js','Chronicle_Control.lua',
  'build.cjs','release.cjs','package.json','README.md','README_KO.md','QUICK_START_KO.md',
  'CHANGELOG.md','RELEASE_NOTES.md',`VALIDATION_v${version}.md`,
- 'LICENSE','THIRD_PARTY_NOTICES.md','RPACK_UPSTREAM_LICENSE.txt','RPACK_LICENSE.txt','rpack_map.bin',
+ 'LICENSE','THIRD_PARTY_NOTICES.md','RPACK_UPSTREAM_LICENSE.txt','RPACK_LICENSE.txt','rpack_map.bin','vendor/re2js.js','vendor/RE2JS_LICENSE.txt','vendor/README.md',
  '.gitignore','.github/ISSUE_TEMPLATE/bug_report.md','.github/workflows/release.yml',
  'Chronicle_Memory.js',`Chronicle_Memory_v${version}.js`,`Chronicle_Control_v${version}.charx`,
  `Chronicle_Control_v${version}.risum`,`Chronicle_Control_v${version}.module.json`,

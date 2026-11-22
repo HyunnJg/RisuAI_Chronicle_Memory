@@ -1,8 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 HyunnJg. See LICENSE; provided without warranty.
-/* Original implementation. No third-party implementation code is included. */
+/* Original Chronicle core. The separately bundled RE2JS engine is listed in THIRD_PARTY_NOTICES.md. */
 const ChronicleCore = (() => {
   'use strict';
+  const SafeRegex=typeof ChronicleRegexEngine!=='undefined'?ChronicleRegexEngine:require('./vendor/re2js.js').RE2JS;
+  const removalCache=new Map();
+  function removalPattern(pattern,flags){
+    const key=flags+'\n'+pattern;if(removalCache.has(key))return removalCache.get(key);
+    let options=0;
+    if(flags.includes('i'))options|=SafeRegex.CASE_INSENSITIVE;
+    if(flags.includes('m'))options|=SafeRegex.MULTILINE;
+    if(flags.includes('s'))options|=SafeRegex.DOTALL;
+    const compiled=SafeRegex.compile(SafeRegex.translateRegExp(pattern),options);
+    if(compiled.programSize()>10000)throw Error('패턴이 너무 복잡합니다. 반복 횟수나 선택지를 줄이세요.');
+    if(removalCache.size>=40)removalCache.delete(removalCache.keys().next().value);
+    removalCache.set(key,compiled);return compiled;
+  }
   const DEFAULTS = Object.freeze({ enabled: false, interval: 5, recent: 5, rawTrim:'rolling',
     charsPerTurn: 100, maxOutputTokens: 500, provider: 'submodel', mode: 'standalone',
     endpoint: '', model: '', tokenField: 'max_tokens',
@@ -55,9 +68,9 @@ const ChronicleCore = (() => {
       const {pattern,flags='g',enabled=true}=row;
       if(typeof pattern!=='string'||!pattern)throw Error(`제거 정규식 ${n}: 패턴을 입력하세요.`);
       if(Array.from(pattern).length>FILTER_PATTERN_LIMIT)throw Error(`제거 정규식 ${n}: 패턴은 ${FILTER_PATTERN_LIMIT}글자 이하만 저장할 수 있습니다.`);
-      if(typeof flags!=='string'||!/^[dgimsuvy]*$/.test(flags)||new Set(flags).size!==flags.length)throw Error(`제거 정규식 ${n}: 플래그는 g·i·m·s·u·y 등을 한 번씩만 쓸 수 있습니다.`);
+      if(typeof flags!=='string'||!/^[gimsu]*$/.test(flags)||new Set(flags).size!==flags.length)throw Error(`제거 정규식 ${n}: 지원 플래그는 g·i·m·s·u이며 한 번씩만 쓸 수 있습니다.`);
       if(typeof enabled!=='boolean')throw Error(`제거 정규식 ${n}: 사용 여부는 참/거짓이어야 합니다.`);
-      try{new RegExp(pattern,flags);}catch(e){throw Error(`제거 정규식 ${n}: 패턴을 해석할 수 없어 저장하지 않았습니다. ${String(e?.message||e).slice(0,200)}`);}
+      try{removalPattern(pattern,flags);}catch(e){throw Error(`제거 정규식 ${n}: 패턴을 해석할 수 없어 저장하지 않았습니다. RE2 문법을 사용하며 전방탐색·역참조는 지원하지 않습니다. ${String(e?.message||e).slice(0,200)}`);}
       return {pattern,flags,enabled};
     });
   }
@@ -70,7 +83,7 @@ const ChronicleCore = (() => {
     let out=String(text);
     for(const [i,row] of filters.entries()){
       if(!row.enabled)continue;
-      try{out=out.replace(new RegExp(row.pattern,row.flags),'');}
+      try{const matcher=removalPattern(row.pattern,row.flags).matcher(out);out=row.flags.includes('g')?matcher.replaceAll(''):matcher.replaceFirst('');}
       catch(e){if(skipped&&!skipped.includes(i+1))skipped.push(i+1);}
     }
     return out;

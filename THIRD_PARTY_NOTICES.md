@@ -21,3 +21,12 @@ Upstream permits the MIT option when RPack is used only within RisuAI and requir
 ## Referenced host API
 
 RisuAI itself is licensed under GPL-3.0. It is not bundled with this plugin. Its API documentation and module format were consulted for compatibility; this project is not an official RisuAI release. The reviewed host revision is the commit listed above.
+
+## RE2JS removal-pattern engine
+
+- Included files: `vendor/re2js.js`, `vendor/RE2JS_LICENSE.txt`, `vendor/README.md`.
+- Source: npm package `re2js@2.10.0`, upstream https://github.com/le0pard/re2js.
+- Copyright (c) 2023 Oleksii Vasyliev. License: MIT.
+- The unmodified UMD build is included locally and wrapped by `build.cjs`.
+- The complete MIT notice is also included in each generated standalone plugin.
+- Used for user-authored removal patterns to avoid native JavaScript catastrophic backtracking.

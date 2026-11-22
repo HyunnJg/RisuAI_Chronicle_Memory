@@ -12,7 +12,11 @@ const header=`//@name RisuChronicleMemory
 // Copyright (C) 2026 HyunnJg. See LICENSE; provided without warranty.
 // See README.md for installation and THIRD_PARTY_NOTICES.md for RPack attribution.
 `;
-const plugin=header+['core.cjs','providers.cjs','retrieval.cjs','storage.cjs','platform.cjs','lifecycle.cjs','runtime.js'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n');
+// Bundle the pinned engine directly: Risu's sandbox CSP disallows blob workers and
+// remote script loading. No native fallback executes user-supplied regex patterns.
+const engine='/*\n'+fs.readFileSync(path.join(root,'vendor/RE2JS_LICENSE.txt'),'utf8')+'\n*/\n'+
+  'const ChronicleRegexEngine=(()=>{const exports={};const module={exports};\n'+fs.readFileSync(path.join(root,'vendor/re2js.js'),'utf8')+'\nreturn module.exports.RE2JS;})();\n';
+const plugin=header+engine+['core.cjs','providers.cjs','retrieval.cjs','storage.cjs','platform.cjs','lifecycle.cjs','runtime.js'].map(p=>fs.readFileSync(path.join(root,p),'utf8')).join('\n');
 fs.writeFileSync(path.join(root,`Chronicle_Memory_v${version}.js`),plugin);
 fs.writeFileSync(path.join(root,'Chronicle_Memory.js'),plugin);
 const toggles=[

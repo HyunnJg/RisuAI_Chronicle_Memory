@@ -663,3 +663,87 @@ test('v0.8.0 removal patterns reach summary input and recall queries but never t
   assert(queries.length>=1);assert(queries.every(q=>!q.includes('OOC')));assert(queries.some(q=>q.includes('보상  확인')));
   assert.equal(h.getState().entries[0].hash,(await C.timeline(message)).turns[4].hash);
 });
+const settle=async()=>{for(let i=0;i<20;i++)await new Promise(r=>setImmediate(r));};
+// Digests resolve on the thread pool, so poll for the expected state instead of counting ticks.
+const until=async(check,label='condition')=>{const end=Date.now()+2000;while(!check()){if(Date.now()>end)throw Error('timed out waiting for '+label);await new Promise(r=>setTimeout(r,2));}};
+const coveredOf=h=>h.getState()?C.covered(h.getState()):0;
+const replyFor=opts=>({type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))});
+function gatedModel(){const gates=[];return {gates,onCall:async opts=>{const gate=controlled();gates.push(gate);await gate.promise;return replyFor(opts);}};}
+test('v0.8.0 summaryBlocking defaults to wait and the wait path still blocks the request on the summary',async()=>{
+  assert.equal(C.settings({}).summaryBlocking,'wait');assert.throws(()=>C.settings({summaryBlocking:'async'}));
+  assert.equal(C.chatSettings({},{scriptstate:{$chronicle_blocking:'nonblocking'}}).summaryBlocking,'nonblocking');
+  const model=gatedModel(),h=await setup({},{onCall:model.onCall});let done=false;
+  const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model').then(out=>{done=true;return out;});
+  await until(()=>model.gates.length===1,'summary call');await settle();assert.equal(done,false);
+  model.gates[0].resolve();const out=await task;assert(out.some(m=>m.memo===C.MARK));assert.equal(C.covered(h.getState()),5);
+});
+test('v0.8.0 nonblocking sends the RP request immediately with unsummarized raw and commits for the next request',async()=>{
+  const model=gatedModel(),h=await setup({summaryBlocking:'nonblocking'},{onCall:model.onCall});
+  const input=formatted(h.char.chats[0].message),out=await h.hooks.beforeRequest(input,'model');
+  await until(()=>model.gates.length===1,'background call');assert(!out.some(m=>m.memo===C.MARK));
+  for(let n=1;n<=10;n++)assert(out.some(m=>m.memo===`a${n}`),`a${n} kept as raw`);
+  // While it runs: no duplicate call and the next RP request is not held by the memory queue.
+  const again=await h.hooks.beforeRequest(input,'model');assert.equal(model.gates.length,1);assert(again.some(m=>m.memo==='a1'));
+  assert.equal(h.getState()?.entries.length||0,0);
+  model.gates[0].resolve();await until(()=>coveredOf(h)===5,'commit T1–T5');
+  const next=await h.hooks.beforeRequest(input,'model');assert(next.some(m=>m.memo===C.MARK));
+  await until(()=>model.gates.length===2,'next batch'); // The next batch starts in the background.
+  model.gates[1].resolve();await until(()=>coveredOf(h)===10,'commit T6–T10');
+});
+test('v0.8.0 nonblocking commits after newer turns arrive but never after the summarized range changes',async()=>{
+  const model=gatedModel(),h=await setup({summaryBlocking:'nonblocking'},{onCall:model.onCall});
+  h.char.chats[0].message=raw(5);await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  await until(()=>model.gates.length===1,'background call');
+  h.char.chats[0].message=raw(7); // The RP reply and another turn land while summarizing T1–T5.
+  model.gates[0].resolve();await until(()=>coveredOf(h)===5,'commit despite newer turns');
+  const r=await setup({summaryBlocking:'nonblocking'},{onCall:(m=>m.onCall)(model)});
+  r.char.chats[0].message=raw(5);await r.hooks.beforeRequest(formatted(r.char.chats[0].message),'model');
+  await until(()=>model.gates.length===2,'second background call');
+  r.char.chats[0].message[9].data='응답5 (재생성)'; // Reroll of the last summarized turn.
+  model.gates[1].resolve();await until(()=>/재생성되어/.test(r.store.get('risu-chronicle:v1:health')||''),'rejection');
+  assert.equal(r.getState()?.entries.length||0,0);assert.match(r.store.get('risu-chronicle:v1:health'),/원문이 요약 도중 수정·재생성/);
+  // The rerolled content is a new source, so it is summarized fresh; that result commits.
+  await r.hooks.beforeRequest(formatted(r.char.chats[0].message),'model');await until(()=>model.gates.length===3,'fresh summary');
+  model.gates[2].resolve();await until(()=>coveredOf(r)===5,'commit of rerolled range');
+  assert.equal(r.getState().entries[0].hash,(await C.timeline(r.char.chats[0].message)).turns[4].hash);
+});
+test('v0.8.0 nonblocking discards a result when the chat was switched',async()=>{
+  const model=gatedModel(),h=await setup({summaryBlocking:'nonblocking'},{onCall:model.onCall});
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await until(()=>model.gates.length===1,'background call');
+  h.char.chats.push({id:'chat-2',name:'다른 대화',message:raw(2)});h.char.chatPage=1;
+  model.gates[0].resolve();await until(()=>/대화가 바뀌어/.test(h.store.get('risu-chronicle:v1:health')||''),'switch rejection');
+  assert.equal(h.getState()?.entries.length||0,0);assert(!h.store.has('risu-chronicle:v1:chat:character-1:chat-2')||JSON.parse(h.store.get('risu-chronicle:v1:chat:character-1:chat-2')).entries.length===0);
+});
+test('v0.8.0 an unfinished background summary is never discarded automatically; stop releases it without saving',async()=>{
+  const doc=waitDocument(),model=gatedModel(),h=await setup({summaryBlocking:'nonblocking'},{onCall:model.onCall,document:doc});
+  const input=formatted(h.char.chats[0].message);
+  await h.hooks.beforeRequest(input,'model');await until(()=>model.gates.length===1,'background call');
+  for(let i=0;i<4;i++){const out=await h.hooks.beforeRequest(input,'model');assert(out.some(m=>m.memo==='a1'));}
+  await settle();assert.equal(model.gates.length,1);
+  doc.listeners.click({target:{id:'stopWait'}});await settle();
+  // The stopped call has not settled yet: no new call for this chat, raw still sent.
+  await h.hooks.beforeRequest(input,'model');assert.equal(model.gates.length,1);
+  model.gates[0].resolve();await settle();await settle();assert.equal(h.getState()?.entries.length||0,0);
+  // Once the stopped call settles, a later request may start again (after the 60s retry wait for that range).
+  await h.hooks.beforeRequest(input,'model');await settle();assert.equal(model.gates.length,1);
+});
+test('v0.8.0 unload during a background summary writes nothing',async()=>{
+  const model=gatedModel(),h=await setup({summaryBlocking:'nonblocking'},{onCall:model.onCall});
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await until(()=>model.gates.length===1,'background call');
+  await h.hooks.unload();const writes=h.writes.length;model.gates[0].resolve();await settle();
+  assert.equal(h.writes.filter(w=>w.key.includes(':chat:')).length,h.writes.slice(0,writes).filter(w=>w.key.includes(':chat:')).length);
+  assert.equal(h.getState()?.entries.length||0,0);
+});
+test('v0.8.0 nonblocking keeps the in-progress range as raw under both rolling and staircase trimming',async()=>{
+  for(const rawTrim of ['rolling','chunk']){
+    const model=gatedModel(),h=await setup({summaryBlocking:'nonblocking',rawTrim},{onCall:model.onCall});
+    h.char.chats[0].message=raw(5);await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+    await until(()=>model.gates.length===1);model.gates[0].resolve();await until(()=>coveredOf(h)===5);
+    h.char.chats[0].message=raw(12);
+    const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await until(()=>model.gates.length===2);
+    assert(out.some(m=>m.memo===C.MARK),rawTrim);
+    for(let n=6;n<=12;n++)assert(out.some(m=>m.memo===`a${n}`),`${rawTrim}: a${n} kept while T6–T10 is summarizing`);
+    if(rawTrim==='rolling')assert(!out.some(m=>m.memo==='a5'));else assert(out.some(m=>m.memo==='a1')); // Staircase keeps N turns before the last commit.
+    model.gates[1].resolve();await until(()=>coveredOf(h)===10);
+  }
+});

@@ -652,3 +652,14 @@ test('v0.8.0 hybrid recent scope leaves old chunks out of the log block and offe
   const full=await all.hooks.beforeRequest(formatted(all.char.chats[0].message),'model');
   assert(full.find(m=>m.memo===C.MARK).content.includes('구간1 (1–5턴)'));assert(!full.find(m=>m.memo===C.MARK).content.includes('생략했다'));
 });
+test('v0.8.0 removal patterns reach summary input and recall queries but never the RP request or hashes',async()=>{
+  const h=await setup({...hybridConfig,inputFilters:[{pattern:'\\[OOC[^\\]]*\\]',flags:'g',enabled:true}]},{onFetch:async(url,opts)=>embeddingResponse(opts)});
+  const message=raw(12);message[1].data='응답1 [OOC: 비밀 메모]';message.at(-1).data='보상 [OOC: 질의 메모] 확인';h.char.chats[0].message=message;
+  const out=await h.hooks.beforeRequest(formatted(message),'model');
+  assert(!h.calls[0].messages[1].content.includes('OOC'));assert.match(h.calls[0].messages[1].content,/응답1 /);
+  assert(out.some(m=>m.content.includes('[OOC: 질의 메모]')));
+  h.char.chats[0].message=message;await h.hooks.beforeRequest(formatted(message),'model');
+  const queries=h.calls.filter(c=>c.url).map(c=>JSON.parse(c.opts.body).input[0]).filter(text=>text.startsWith('최근 상황:')||text.startsWith('사용자:'));
+  assert(queries.length>=1);assert(queries.every(q=>!q.includes('OOC')));assert(queries.some(q=>q.includes('보상  확인')));
+  assert.equal(h.getState().entries[0].hash,(await C.timeline(message)).turns[4].hash);
+});

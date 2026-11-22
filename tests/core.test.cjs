@@ -503,3 +503,26 @@ test('v0.8.0 hybrid log scope injects recent K chunks only in hybrid and keeps a
   const resolved=C.chatSettings({mode:'hybrid'},chat);assert.equal(resolved.hybridLogScope,'recent');assert.equal(resolved.hybridRecentChunks,3);
   assert.equal(C.chatSettings({mode:'hybrid'},{scriptstate:{$chronicle_hybrid_scope:'bogus'}}).hybridLogScope,'all');
 });
+test('v0.8.0 removal patterns are validated, capped, applied in order and skipped individually on errors',async()=>{
+  assert.deepEqual(C.settings({}).inputFilters,[]);
+  const ok=C.settings({inputFilters:[{pattern:'\\[OOC[^\\]]*\\]\\s*',flags:'gi',enabled:true},{pattern:'상태창',enabled:false}]});
+  assert.deepEqual(ok.inputFilters,[{pattern:'\\[OOC[^\\]]*\\]\\s*',flags:'gi',enabled:true},{pattern:'상태창',flags:'g',enabled:false}]);
+  for(const [bad,message] of [[[{pattern:'(unclosed',flags:'g'}],/해석할 수 없어 저장하지 않았습니다/],[[{pattern:'',flags:'g'}],/패턴을 입력/],
+    [[{pattern:'a'.repeat(501)}],/500글자 이하/],[[{pattern:'a',flags:'gg'}],/플래그/],[[{pattern:'a',flags:'x'}],/플래그/],[[{pattern:'a',enabled:'yes'}],/참\/거짓/],
+    [Array.from({length:21},()=>({pattern:'a'})),/최대 20개/],['a',/목록 형식/]])assert.throws(()=>C.settings({inputFilters:bad}),message);
+  assert.equal(C.settings({inputFilters:Array.from({length:20},()=>({pattern:'a'}))}).inputFilters.length,20);
+  assert.equal(C.settings({inputFilters:[{pattern:'가'.repeat(500)}]}).inputFilters.length,1);
+  for(const risky of ['(a+)+','(\\w*)*b','(?:ab+)*','(x{1,3})+'])assert.equal(C.riskyPattern(risky),true,risky);
+  for(const safe of ['a+b+','(ab)+','\\(a+\\)+','\\[OOC[^\\]]*\\]'])assert.equal(C.riskyPattern(safe),false,safe);
+  // A pattern that throws while running is skipped; the others still apply.
+  let reads=0;const broken={enabled:true,flags:'g',get pattern(){if(++reads>0)throw Error('boom');return 'x';}};
+  const skipped=[];assert.equal(C.applyFilters('A [OOC: x] B 상태창',[broken,ok.inputFilters[0],{pattern:'상태창',flags:'g',enabled:true}],skipped),'A B ');
+  assert.deepEqual(skipped,[1]);
+  // Order: cleanup → names → user patterns, so a pattern can match a substituted name.
+  const s=C.settings({inputFilters:[{pattern:'리아:\\s*',flags:'g',enabled:true}]});
+  const tl=await C.timeline([{role:'user',data:'<div>음. {{char}}: 안녕</div>',chatId:'u1'},{role:'char',data:'반가워',chatId:'a1'}]);
+  assert.equal(C.summaryInput(tl.turns,s,{charName:'리아'})[0].messages[0].content,'음. 안녕');
+  // Patterns apply even with cleanup off, but names do not.
+  assert.equal(C.summaryInput(tl.turns,{...s,cleanSummaryInput:false},{charName:'리아'})[0].messages[0].content,'<div>음. {{char}}: 안녕</div>');
+  assert.equal(tl.turns[0].messages[0].data,'<div>음. {{char}}: 안녕</div>');
+});

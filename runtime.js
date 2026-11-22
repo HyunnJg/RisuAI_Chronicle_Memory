@@ -128,9 +128,25 @@
     const key=NS+'chat:'+encodeURIComponent(char.chaId)+':'+encodeURIComponent(chat.id);
     return {key,characterIndex,chatIndex,charId:char.chaId,chatId:chat.id,charName:char.name,chatName:chat.name,chat};
   }
+  // {{user}} through Risu's own CBS parser for the selected chat: no extra permission prompt,
+  // no variable writes or regex scripts. Older hosts without it, or odd output, fall back to '사용자'.
+  async function personaName() {
+    if(typeof api.parseRisuChat!=='function')return '';
+    try{
+      const value=await api.parseRisuChat('{{user}}',{runVar:false,processRegex:false});
+      const name=typeof value==='string'?value.trim():'';
+      return name&&!/[{}\r\n]/.test(name)&&Array.from(name).length<=80?name:'';
+    }catch{return '';}
+  }
+  async function withUserName(ctx) {
+    const userName=await personaName();
+    // The parser reads the currently selected chat; ignore a name read after a switch.
+    if(!userName||ctx.characterIndex!==await api.getCurrentCharacterIndex()||ctx.chatIndex!==await api.getCurrentChatIndex())return ctx;
+    return {...ctx,userName};
+  }
   async function context() {
     E.assertMemory();const ctx=await conversation();
-    return {...ctx,tl:await timeline(ctx.chat.message)};
+    return withUserName({...ctx,tl:await timeline(ctx.chat.message)});
   }
   async function persistState(ctx,state) {
     if(unloaded)throw waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 기록을 저장하지 않습니다.');
@@ -366,7 +382,7 @@
       try{
         const global=await config(),base=await conversation(),s=C.chatSettings(global,base.chat);
         if(!s.enabled)return messages;
-        E.assertMemory();const ctx={...base,tl:await timeline(base.chat.message)};
+        E.assertMemory();const ctx=await withUserName({...base,tl:await timeline(base.chat.message)});
         const initial=await stateFor(ctx);let state,started='';
         if(s.summaryBlocking==='nonblocking'){
           // Send now with the saved log plus unsummarized raw; the new chunk applies next request.
@@ -809,6 +825,7 @@
       <details id="filterPanel"><summary>사용자 지정 제거 정규식 · 요약·검색 입력 전용</summary>
       <p>OOC·텍스트 상태창처럼 봇마다 다른 노이즈를 요약 모델과 하이브리드 검색 쿼리에 보내기 전에 지웁니다. 실제 저장 원문·RP 요청·원문 변경 감지는 바꾸지 않습니다. 적용 순서는 입력 정리 → {{user}}/{{char}} 치환 → 아래 규칙 순이며, 규칙은 입력 정리 사용 여부와 관계없이 켠 것만 적용합니다. 일치한 부분을 빈 문자열로 바꿉니다.</p>
       <p>최대 ${C.FILTER_LIMIT}개 · 패턴 ${C.FILTER_PATTERN_LIMIT}글자 이하. 해석할 수 없는 패턴은 저장하지 않습니다. 실행 중 오류가 난 규칙은 그 규칙만 건너뜁니다. (a+)+ 같은 중첩 반복은 기기를 멈추게 할 수 있어 경고하지만 모든 위험 패턴을 찾아내지는 못합니다.</p>
+      <p><strong>단순한 패턴을 권장합니다.</strong> 예: <code>\\[OOC[^\\]]*\\]</code>처럼 고정 문자 + 부정 문자 클래스로 끝을 정하세요. 반복 그룹 안에 다시 반복을 넣거나 <code>.*</code>를 여러 번 겹쳐 쓰면 긴 대화에서 브라우저가 멈출 수 있습니다. 이상하게 느려지면 해당 규칙을 끄세요.</p>
       <div id="filterRows"></div><small id="filterCount"></small>
       <div class="row"><button id="addFilter" class="secondary">제거 규칙 추가</button></div>
       <label>미리보기 샘플 텍스트 · 제거 전<textarea id="filterSample" rows="4" placeholder="예: 그녀가 웃었다. [OOC: 다음 장면으로]"></textarea></label>

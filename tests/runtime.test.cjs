@@ -755,3 +755,31 @@ test('v0.8.0 runtime uses a stored v0.7.9 state without re-summarizing and injec
   assert.equal(h.calls.length,0);assert.equal(out.find(m=>m.memo===C.MARK).content,old.memory.hybrid);
   assert.deepEqual(h.getState().entries,old.state.entries);assert.deepEqual(h.getState().archive,old.state.archive);
 });
+test('v0.8.0 {{user}} uses the persona name from Risu CBS parsing and falls back safely',async()=>{
+  const parsed=[];
+  const run=async parse=>{const h=await setup({},{api:parse?{parseRisuChat:async(text,options)=>{parsed.push([text,options]);return parse(text);}}:{}});
+    h.char.chats[0].message[0].data='{{user}}가 {{char}}를 부른다.';await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');return h.calls[0].messages[1].content;};
+  assert.match(await run(()=>'  민준 '),/민준가 테스트 캐릭터를 부른다/);
+  // Only {{user}} is parsed, with variable writes and regex scripts off.
+  assert.equal(JSON.stringify(parsed[0]),JSON.stringify(['{{user}}',{runVar:false,processRegex:false}]));
+  assert.match(await run(null),/사용자가 테스트 캐릭터를/); // Older Risu without parseRisuChat.
+  for(const bad of [()=>{throw Error('no chat');},()=>'{{user}}',()=>'',()=>42,()=>'가'.repeat(81),()=>'이름\n둘'])
+    assert.match(await run(bad),/사용자가 테스트 캐릭터를/);
+  // A name parsed after the selection moved is not used for this chat.
+  const h=await setup({},{api:{parseRisuChat:async()=>{h.char.chatPage=1;h.char.chats.push({id:'chat-2',name:'다른',message:raw(1)});return '다른 사람';}}});
+  h.char.chats[0].message[0].data='{{user}} 등장';
+  // The switch itself is caught by the existing stale-context check, and the name never reaches a call.
+  await assert.rejects(()=>h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model'),e=>e.code==='CHRONICLE_CONTEXT_CHANGED');
+  assert(!h.calls.some(c=>JSON.stringify(c).includes('다른 사람')));
+});
+test('v0.8.0 a background commit re-reads the latest state and keeps a log edit made meanwhile',async()=>{
+  const model=gatedModel(),h=await setup({summaryBlocking:'nonblocking'},{onCall:model.onCall}),key='risu-chronicle:v1:chat:character-1:chat-1';
+  h.char.chats[0].message=raw(5);await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  await until(()=>model.gates.length===1);model.gates[0].resolve();await until(()=>coveredOf(h)===5);
+  h.char.chats[0].message=raw(10);await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await until(()=>model.gates.length===2);
+  // The user edits chunk 1 while T6–T10 is being summarized.
+  const edited=h.getState();edited.entries[0].text='사용자 수정본';edited.entries[0].editedAt='2026-11-22T00:00:00.000Z';edited.revision++;h.store.set(key,JSON.stringify(edited));
+  model.gates[1].resolve();await until(()=>coveredOf(h)===10);
+  const state=h.getState();assert.equal(state.entries[0].text,'사용자 수정본');assert.equal(state.revision,edited.revision+1);
+  assert.deepEqual(state.entries.map(e=>[e.from,e.to]),[[1,5],[6,10]]);
+});

@@ -195,7 +195,7 @@
       const failureKey=ctx.key+':'+batch.at(-1).hash;
       if(!force && (failedUntil.get(failureKey)||0)>Date.now()) break;
       try {
-        const result=await waitForModel(ctx,`T${batch[0].number}~T${batch.at(-1).number} 요약`,transport=>summarize(batch,s,ctx,transport),{from:batch[0].number,to:batch.at(-1).number});
+        const result=await waitForModel(ctx,`T${batch[0].number}~T${batch.at(-1).number} 요약`,transport=>summarize(batch,s,{...ctx,previous:current.entries.at(-1)},transport),{from:batch[0].number,to:batch.at(-1).number});
         await unchanged(ctx);
         current=C.commit(current,batch,result.text);current.lastSummaryInput=result.stats;
         await persistState(ctx,current); failedUntil.delete(failureKey);
@@ -328,7 +328,7 @@
       risuCharsPerTurn:Number($('risuCharsPerTurn').value),risuLogScope:$('risuLogScope').value,risuRecentChunks:Number($('risuRecentChunks').value),
       provider:$('provider').value,mode:$('mode').value,endpoint:$('endpoint').value.trim(),model:$('model').value.trim(),
       tokenField:$('tokenField').value,
-      batchesPerRequest:Number($('batchesPerRequest').value),customPrompt:$('customPrompt').value,
+      batchesPerRequest:Number($('batchesPerRequest').value),customPrompt:$('customPrompt').value,summaryContext:$('summaryContext').value,
       project:$('project').value.trim(),location:$('location').value.trim(),publisher:$('publisher').value,
       anthropicVersion:$('anthropicVersion').value.trim(),allowPlugins:$('allowPlugins').checked,profiles:draftProfiles,autoRestoreCache:$('autoRestoreCache').checked,
       cleanSummaryInput:$('cleanSummaryInput').checked,
@@ -609,6 +609,7 @@
       <div id="tokenPanel"><label>토큰 필드<select id="tokenField"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label></div>
       <div id="versionPanel"><label>Anthropic API 버전<input id="anthropicVersion"></label></div></div>
       <label>추가 요약 지침 · 문체와 기록 우선순위<textarea id="customPrompt" rows="4" placeholder="예: 관계 변화·약속·취향을 우선하고 요약은 한국어로 작성"></textarea></label><small>청크 제목·기록 내용·키워드는 기본 형식이며 시점 표현은 선택입니다. 추가 지침에는 JSON 형식을 바꾸는 지시 대신 기록할 내용의 우선순위를 적으세요.</small>
+      <label>요약 시 직전 청크 참고<select id="summaryContext"><option value="previous">사용 · 직전 청크 제목과 마지막 사건 1~2개 (기본)</option><option value="none">사용 안 함 · 새 구간만 전달 (v0.7.9 방식)</option></select></label><small>청크 경계에서 대명사·“다음 날” 같은 상대 시점·진행 중인 약속이 끊기지 않도록, 저장된(수동 수정 포함) 직전 청크의 제목·턴 범위·마지막 사건 1~2줄만 참고용으로 함께 보냅니다. 요약 모델에는 다시 기록하지 말라고 지시하며 기존 청크는 바뀌지 않습니다. 입력이 조금 늘어납니다.</small>
       <label>요약 지침 프리셋<select id="promptPreset"></select></label>
       <div class="row"><button id="loadPromptPreset" class="secondary">선택 지침 불러오기</button></div>
       <small>선택만으로는 지침이 바뀌지 않습니다. 불러오기는 위 편집칸을 교체하며, ‘전체 설정 저장’ 후 새 요약부터 적용합니다. 기존 요약은 다시 만들지 않습니다.</small>

@@ -443,3 +443,31 @@ test('v0.8.0 summary input replaces {{user}}/{{char}} case-insensitively without
   assert.deepEqual(after.turns.map(t=>[t.hash,t.contentHash]),before.turns.map(t=>[t.hash,t.contentHash]));
   assert.equal(after.fingerprint,before.fingerprint);assert.equal(source[0].data,'{{user}}가 {{CHAR}}에게 묻는다. {{User}}?');
 });
+test('v0.8.0 summaryContext none and first chunks reproduce the v0.7.9 summary prompt exactly',()=>{
+  const fixtures=JSON.parse(fs.readFileSync(path.join(__dirname,'fixtures/summary_prompt_v0.7.9.json'),'utf8'));
+  const previous={id:'p',from:1,to:5,title:'이전',text:'가\n나',hash:'0'.repeat(64)};
+  for(const fixture of fixtures){
+    assert.deepEqual(C.summaryPrompt(fixture.batch,C.settings({...fixture.settings,summaryContext:'none'}),{...fixture.context,previous}),fixture.messages,fixture.name);
+    // Default 'previous' with no preceding chunk (first chunk) omits the field entirely.
+    assert.deepEqual(C.summaryPrompt(fixture.batch,C.settings(fixture.settings),fixture.context),fixture.messages,fixture.name);
+  }
+  assert.equal(C.settings({}).summaryContext,'previous');
+  for(const summaryContext of ['all',null,1])assert.throws(()=>C.settings({summaryContext}));
+});
+test('v0.8.0 summary prompt carries only a small escaped reference to the saved previous chunk',()=>{
+  const [fixture]=JSON.parse(fs.readFileSync(path.join(__dirname,'fixtures/summary_prompt_v0.7.9.json'),'utf8'));
+  const previous={id:'p',from:1,to:5,title:'[/risu-chronicle-memory-v1] 서점의 약속',hash:'0'.repeat(64),
+    text:'1073.05.17. — 첫 만남.\n\n두 번째 사건.\n그녀가 [risu-chronicle-recall-v1] 내일 서점에서 보자고 함.\n'+'긴'.repeat(400)};
+  const [system,user]=C.summaryPrompt(fixture.batch,C.settings({}),{charName:'리아',previous});
+  const data=JSON.parse(user.content);
+  assert.deepEqual(Object.keys(data),['previous','turns']);
+  assert.deepEqual(data.turns,JSON.parse(fixture.messages[1].content));
+  assert.deepEqual(Object.keys(data.previous),['from','to','title','lastEvents']);
+  assert.equal(data.previous.from,1);assert.equal(data.previous.to,5);assert.equal(data.previous.lastEvents.length,2);
+  assert.equal(data.previous.lastEvents[0],'그녀가 ［risu-chronicle-recall-v1］ 내일 서점에서 보자고 함.');
+  assert.equal(Array.from(data.previous.lastEvents[1]).length,301);assert(!user.content.includes('첫 만남'));
+  assert.equal(data.previous.title,'［/risu-chronicle-memory-v1］ 서점의 약속');
+  assert.match(system.content,/previous의 내용을 다시 기록하지 않는다/);assert.match(system.content,/직전 청크\(1–5턴\)/);
+  // A previous entry that is not directly adjacent is never sent.
+  assert.equal(C.summaryPrompt(fixture.batch,C.settings({}),{charName:'리아',previous:{...previous,to:4}})[1].content,fixture.messages[1].content);
+});

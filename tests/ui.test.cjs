@@ -14,7 +14,7 @@ function documentMock() {
     insertAdjacentHTML(_position,html){parseMarkup(html);}
     focus(){} select(){} setSelectionRange(){} removeAttribute(key){delete this[key];}
   }
-  const doc={head:{innerHTML:''},visibilityState:'visible',getElementById:id=>ids.get(id)||null,createElement:tag=>new Element(tag),
+  const doc={head:{innerHTML:''},visibilityState:'visible',getElementById:id=>ids.get(id)||null,createElement:tag=>new Element(tag),createTextNode:text=>({textContent:text}),
     addEventListener:(name,fn)=>listeners.set(name,fn),removeEventListener:(name,fn)=>{assert.equal(listeners.get(name),fn);listeners.delete(name);},
     querySelectorAll:selector=>{
       const data=/^\[data-([a-z-]+)\]$/.exec(selector),key=data&&data[1].replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
@@ -144,4 +144,21 @@ test('v0.8.0 re-summary asks to save pending log edits first and blocks a stale 
   // Memory changed after the confirmation opened (e.g. an RP request committed a chunk).
   const state=JSON.parse(h.store.get(STATE_KEY));state.revision+=5;h.store.set(STATE_KEY,JSON.stringify(state));
   await h.click('confirmResummarize');assert.equal(calls.length,0);assert.match(h.get('status').textContent,/기억이 변경되었습니다/);
+});
+test('v0.8.0 settings reject invalid removal patterns, preview removals, and warn on nested quantifiers',async()=>{
+  const h=await setup('denied',{settings:{inputFilters:[{pattern:'\\[OOC[^\\]]*\\]',flags:'g',enabled:true}]}});await h.open();
+  const rows=()=>h.all.filter(e=>e.dataset.filterPattern!==undefined);
+  assert.equal(rows().length,1);assert.equal(rows()[0].value,'\\[OOC[^\\]]*\\]');assert.match(h.get('filterCount').textContent,/1\/20/);
+  h.get('filterSample').value='그녀가 웃었다. [OOC: 다음 장면]';h.get('previewFilters').onclick();
+  assert.equal(h.get('filterResult').value,'그녀가 웃었다. ');assert.match(h.get('filterState').textContent,/제거 전 21글자 → 제거 후 9글자/);
+  h.get('addFilter').onclick();assert.equal(rows().length,2);rows()[1].value='(unclosed';
+  const saved=h.store.get('risu-chronicle:v1:settings');
+  await h.click('saveSettings');assert.match(h.get('status').textContent,/규칙 2: 패턴을 해석할 수 없어 저장하지 않았습니다|제거 정규식 2/);
+  assert.equal(h.store.get('risu-chronicle:v1:settings'),saved);
+  rows()[1].value='(a+)+';h.get('previewFilters').onclick();assert.match(h.get('filterState').textContent,/규칙 2번은 중첩 반복/);
+  await h.click('saveSettings');assert.match(h.get('status').textContent,/설정 저장 완료 · 제거 규칙 2번은 중첩 반복/);
+  assert.deepEqual(JSON.parse(h.store.get('risu-chronicle:v1:settings')).inputFilters.map(r=>r.pattern),['\\[OOC[^\\]]*\\]','(a+)+']);
+  // Deleting a row and leaving an empty one stores only real patterns.
+  h.all.filter(e=>e.textContent==='이 규칙 삭제')[1].onclick();h.get('addFilter').onclick();assert.equal(rows().length,2);
+  await h.click('saveSettings');assert.deepEqual(JSON.parse(h.store.get('risu-chronicle:v1:settings')).inputFilters.map(r=>r.pattern),['\\[OOC[^\\]]*\\]']);
 });

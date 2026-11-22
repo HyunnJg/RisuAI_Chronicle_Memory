@@ -12,7 +12,7 @@ const ChronicleCore = (() => {
     embeddingProvider:'gemini', embeddingModel:'', embeddingEndpoint:'', embeddingProject:'', embeddingLocation:'us-central1',
     embeddingVertexMethod:'predict', embeddingReuseCredential:true, embeddingProfiles:{},
     recallTopK:3, recallCharBudget:2200, recallMinSimilarity:0.4, embeddingBatchesPerRequest:8,
-    summaryContext:'previous', hybridLogScope:'all', hybridRecentChunks:10 });
+    summaryContext:'previous', hybridLogScope:'all', hybridRecentChunks:10, inputFilters:[] });
   function settings(input = {}) {
     if(!input||typeof input!=='object'||Array.isArray(input))throw Error('설정은 객체 형식이어야 합니다.');
     const s = { ...DEFAULTS, ...input };
@@ -40,7 +40,39 @@ const ChronicleCore = (() => {
     if (typeof s.cleanSummaryInput !== 'boolean') throw Error('입력 정리는 참/거짓이어야 합니다.');
     for (const k of ['endpoint','model','customPrompt','project','location','publisher','anthropicVersion','embeddingModel','embeddingEndpoint','embeddingProject','embeddingLocation']) if (typeof s[k] !== 'string') throw Error(`${k}: 문자열이 필요합니다.`);
     if (!['google','anthropic'].includes(s.publisher)) throw Error('Vertex publisher 설정 오류');
+    s.inputFilters=validateFilters(s.inputFilters);
     return s;
+  }
+  const FILTER_LIMIT=20,FILTER_PATTERN_LIMIT=500;
+  // User removal patterns for summary/search input. Invalid lists are rejected, never repaired.
+  function validateFilters(list){
+    if(!Array.isArray(list))throw Error('제거 정규식 목록 형식이 올바르지 않습니다.');
+    if(list.length>FILTER_LIMIT)throw Error(`제거 정규식은 최대 ${FILTER_LIMIT}개까지 저장할 수 있습니다.`);
+    return list.map((row,i)=>{
+      const n=i+1;
+      if(!row||typeof row!=='object'||Array.isArray(row))throw Error(`제거 정규식 ${n}: 형식이 올바르지 않습니다.`);
+      const {pattern,flags='g',enabled=true}=row;
+      if(typeof pattern!=='string'||!pattern)throw Error(`제거 정규식 ${n}: 패턴을 입력하세요.`);
+      if(Array.from(pattern).length>FILTER_PATTERN_LIMIT)throw Error(`제거 정규식 ${n}: 패턴은 ${FILTER_PATTERN_LIMIT}글자 이하만 저장할 수 있습니다.`);
+      if(typeof flags!=='string'||!/^[dgimsuvy]*$/.test(flags)||new Set(flags).size!==flags.length)throw Error(`제거 정규식 ${n}: 플래그는 g·i·m·s·u·y 등을 한 번씩만 쓸 수 있습니다.`);
+      if(typeof enabled!=='boolean')throw Error(`제거 정규식 ${n}: 사용 여부는 참/거짓이어야 합니다.`);
+      try{new RegExp(pattern,flags);}catch(e){throw Error(`제거 정규식 ${n}: 패턴을 해석할 수 없어 저장하지 않았습니다. ${String(e?.message||e).slice(0,200)}`);}
+      return {pattern,flags,enabled};
+    });
+  }
+  // Heuristic only: a quantified group that itself ends in a quantifier, e.g. (a+)+ or (\w*)*.
+  function riskyPattern(pattern){
+    return /\((?:\?[:=!]|\?<[^>]*>)?(?:[^()\\]|\\.)*(?:[+*]|\{\d*,?\d*\})\??\)(?:[+*]|\{\d*,?\d*\})/.test(String(pattern));
+  }
+  // Each pattern runs on its own; one that throws is skipped and the rest still apply.
+  function applyFilters(text,filters=[],skipped=null){
+    let out=String(text);
+    for(const [i,row] of filters.entries()){
+      if(!row.enabled)continue;
+      try{out=out.replace(new RegExp(row.pattern,row.flags),'');}
+      catch(e){if(skipped&&!skipped.includes(i+1))skipped.push(i+1);}
+    }
+    return out;
   }
   const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',rawTrim:'chronicle_raw_trim',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks',hybridLogScope:'chronicle_hybrid_scope',hybridRecentChunks:'chronicle_hybrid_chunks'};
   function chatSettings(s,chat) {
@@ -212,8 +244,10 @@ const ChronicleCore = (() => {
     return String(text).replace(/\{\{(user|char)\}\}/gi,(_,key)=>key.toLowerCase()==='user'?user:char);
   }
   // Summary/search input only. Hashes and stored source messages never pass through here.
+  // Order: summary clean() (caller) → {{user}}/{{char}} with cleanup → user removal patterns.
   function inputText(text,s,context={}){
-    return s.cleanSummaryInput?substituteNames(text,context):String(text);
+    const named=s.cleanSummaryInput?substituteNames(text,context):String(text);
+    return s.inputFilters?.length?applyFilters(named,s.inputFilters,context.skippedFilters):named;
   }
   const summaryPerTurn=s=>s.mode==='risu'?s.risuCharsPerTurn:s.charsPerTurn;
   const summaryTarget=(s,turnCount=1)=>summaryPerTurn(s)*turnCount;
@@ -432,6 +466,6 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,validateFilters,riskyPattern,applyFilters,FILTER_LIMIT,FILTER_PATTERN_LIMIT,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;

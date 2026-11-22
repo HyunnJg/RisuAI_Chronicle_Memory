@@ -179,9 +179,10 @@
     if(now.key!==ctx.key || C.sourceText(now.chat.message)!==ctx.tl.sourceText){const error=Error('처리 중 대화/원문이 바뀌어 결과를 폐기했습니다. 다시 시도하세요.');error.code='CHRONICLE_CONTEXT_CHANGED';throw error;}
   }
   async function summarize(batch,s,ctx,transport=api) {
-    const messages=C.summaryPrompt(batch,s,ctx),started=Date.now();
+    const skippedFilters=[],messages=C.summaryPrompt(batch,s,{...ctx,skippedFilters}),started=Date.now();
     const text=await P.complete(transport,s,await credential(s.provider,s),messages);
     const parsed=C.parseSummary(text,batch,s);
+    if(skippedFilters.length)parsed.warnings=[...parsed.warnings,`제거 정규식 ${skippedFilters.join(', ')}번이 실행 중 오류를 내 해당 규칙만 건너뛰고 요약했습니다.`];
     return {text:parsed,stats:{from:batch[0].number,to:batch.at(-1).number,summaryChars:parsed.contentChars,summaryTargetChars:parsed.targetChars,
       originalChars:C.chars(JSON.stringify(C.summaryInput(batch,{...s,cleanSummaryInput:false},ctx))),
       sentChars:C.chars(messages[1].content),seconds:Math.round((Date.now()-started)/100)/10,cleaned:s.cleanSummaryInput}};
@@ -358,10 +359,49 @@
       batchesPerRequest:Number($('batchesPerRequest').value),customPrompt:$('customPrompt').value,summaryContext:$('summaryContext').value,
       project:$('project').value.trim(),location:$('location').value.trim(),publisher:$('publisher').value,
       anthropicVersion:$('anthropicVersion').value.trim(),allowPlugins:$('allowPlugins').checked,profiles:draftProfiles,autoRestoreCache:$('autoRestoreCache').checked,
-      cleanSummaryInput:$('cleanSummaryInput').checked,
+      cleanSummaryInput:$('cleanSummaryInput').checked,inputFilters:readFilters(),
       ...Object.fromEntries(EMBEDDING_KEYS.map(k=>[k,k==='embeddingReuseCredential'?($('embeddingProvider').value!=='voyage'&&$(k).checked):$(k).value.trim()])),
       embeddingProvider:$('embeddingProvider').value,embeddingProfiles:draftEmbeddingProfiles,
       recallTopK:Number($('recallTopK').value),recallCharBudget:Number($('recallCharBudget').value),recallMinSimilarity:Number($('recallMinSimilarity').value),embeddingBatchesPerRequest:Number($('embeddingBatchesPerRequest').value)});
+  }
+  // Removal pattern rows are plain inputs; dynamic values never go through innerHTML.
+  function readFilters(){
+    return currentFilterRows().map(row=>({...row,flags:row.flags.trim()})).filter(row=>row.pattern!=='');
+  }
+  function renderFilters(list){
+    const container=$('filterRows');container.replaceChildren();
+    list.forEach((row,i)=>{
+      const group=document.createElement('div');group.className='grid filterRow';
+      const patternLabel=document.createElement('label');patternLabel.textContent=`규칙 ${i+1} · 정규식 패턴 (최대 ${C.FILTER_PATTERN_LIMIT}글자)`;
+      const pattern=document.createElement('input');pattern.dataset.filterPattern=String(i);pattern.value=row.pattern;pattern.placeholder='예: \\[OOC[^\\]]*\\]';patternLabel.appendChild(pattern);
+      const flagsLabel=document.createElement('label');flagsLabel.textContent='플래그 (예: g, gi)';
+      const flags=document.createElement('input');flags.dataset.filterFlags=String(i);flags.value=row.flags;flagsLabel.appendChild(flags);
+      const enabledLabel=document.createElement('label');const enabled=document.createElement('input');enabled.type='checkbox';enabled.dataset.filterEnabled=String(i);enabled.checked=row.enabled;
+      enabledLabel.appendChild(enabled);enabledLabel.appendChild(document.createTextNode(' 사용'));
+      const remove=document.createElement('button');remove.className='secondary';remove.textContent='이 규칙 삭제';
+      remove.onclick=()=>renderFilters(currentFilterRows().filter((_,j)=>j!==i));
+      for(const node of [patternLabel,flagsLabel,enabledLabel,remove])group.appendChild(node);
+      container.appendChild(group);
+    });
+    $('filterCount').textContent=`제거 규칙 ${list.length}/${C.FILTER_LIMIT}개 · 빈 패턴은 저장하지 않습니다.`;
+    $('addFilter').disabled=list.length>=C.FILTER_LIMIT;
+  }
+  // Unlike readFilters(), keeps empty rows so editing never loses an unfinished row.
+  function currentFilterRows(){
+    return [...document.querySelectorAll('[data-filter-pattern]')].map(input=>{
+      const i=input.dataset.filterPattern;
+      return {pattern:input.value,flags:[...document.querySelectorAll('[data-filter-flags]')].find(e=>e.dataset.filterFlags===i)?.value||'',
+        enabled:!![...document.querySelectorAll('[data-filter-enabled]')].find(e=>e.dataset.filterEnabled===i)?.checked};
+    });
+  }
+  function previewFilters(){
+    const filters=C.validateFilters(readFilters()),risky=filters.map((row,i)=>C.riskyPattern(row.pattern)?i+1:0).filter(Boolean);
+    const runnable=filters.map((row,i)=>risky.includes(i+1)?{...row,enabled:false}:row),skipped=[],sample=$('filterSample').value;
+    const result=C.applyFilters(sample,runnable,skipped);$('filterResult').value=result;
+    $('filterState').textContent=[`제거 전 ${C.chars(sample)}글자 → 제거 후 ${C.chars(result)}글자 · 사용 중인 규칙 ${filters.filter(r=>r.enabled).length}개`,
+      risky.length?`규칙 ${risky.join(', ')}번은 중첩 반복 (a+)+ 형태라 입력에 따라 매우 느려질 수 있어 미리보기에서 실행하지 않았습니다. 저장은 가능하지만 패턴을 단순하게 바꾸는 것을 권장합니다.`:'',
+      skipped.length?`규칙 ${skipped.join(', ')}번은 실행 중 오류로 건너뛰었습니다.`:''].filter(Boolean).join('\n');
+    notify('제거 정규식 미리보기를 표시했습니다. 실제 적용은 전체 설정 저장 후 새 요약·검색부터입니다.');
   }
   function modeControls(){
     const paired=$('mode').value==='risu';
@@ -455,13 +495,15 @@
       remember(key);await saveCredential(provider,key,draftEmbeddingBindings[provider],true);
     }
     await save(SETTINGS,s);failedUntil.clear();embeddingFailedUntil.clear();
+    const risky=s.inputFilters.map((row,i)=>C.riskyPattern(row.pattern)?i+1:0).filter(Boolean);
     if(recoveringConfig){recoveringConfig=false;$('diagnostics').textContent='설정을 복구했습니다. 현재 대화 불러오기로 적용값을 확인할 수 있습니다.';}
     $('apiKey').value=visibleProvider==='vertex'?'':draftSecrets[visibleProvider] || '';
     renderVertex();renderBinding(false);renderBinding(true);
     $('clearKey').checked=false;
     $('keyState').textContent=draftSecrets[visibleProvider]?'인증정보 저장됨 · 이 기기에 유지':'인증정보 없음';
     $('embeddingSecret').value=draftEmbeddingSecrets[visibleEmbeddingProvider]||'';$('embeddingClearSecret').checked=false;
-    notify('설정 저장 완료');
+    renderFilters(s.inputFilters);
+    notify('설정 저장 완료'+(risky.length?` · 제거 규칙 ${risky.join(', ')}번은 중첩 반복 형태라 입력에 따라 매우 느려질 수 있습니다. 패턴을 단순하게 바꾸는 것을 권장합니다.`:''));
     // Registration uses neither the memory queue nor uiBusy: an unanswered host prompt
     // must not block settings, backups, or a current RP request.
     if(hookLifecycle&&s.enabled)void requestHook();
@@ -697,7 +739,15 @@
       <label id="risuChunkCount">최근 청크 수 K<input id="risuRecentChunks" type="number" min="1" max="100"></label></div>
       <p>하이파 등 내장 기억을 Risu에서 직접 켜세요. 원문과 과거 세부 검색은 Risu에 맡기며 이 플러그인은 원문을 자르거나 복원하지 않습니다. 연대기는 저장 원문에서 위 요약 주기마다 새 구간만 압축합니다. 기본 5턴 × 50글자면 본문 약 250글자이며 중요한 사실·추가 지침 때문에 넘겨도 수용합니다.</p>
       <p>전체 로그는 계속 저장합니다. 최근 K청크·기록만은 주입 범위만 바꾸며 백업·편집은 전체 기록을 유지합니다. 이미 저장한 로그는 다시 압축하지 않고 새 구간부터 병행 전용 목표를 적용합니다. 전체 주입 시 누적 로그만큼 입력은 늘며, 연대기는 내장 기억 처리 뒤에 추가되므로 최종 컨텍스트 여유를 Risu에서 확보하세요. 내장 기억이 먼저 제외한 미요약 원문을 연대기가 되살리지는 않습니다.</p></div>
-      <label><input id="cleanSummaryInput" type="checkbox"> 요약 입력 정리: 이미지·BGM 등 장식 정리 · 구조화 상태 원문 유지</label>
+      <label><input id="cleanSummaryInput" type="checkbox"> 요약 입력 정리: 이미지·BGM 등 장식 정리 · {{user}}/{{char}} 이름 치환 · 구조화 상태 원문 유지</label>
+      <details id="filterPanel"><summary>사용자 지정 제거 정규식 · 요약·검색 입력 전용</summary>
+      <p>OOC·텍스트 상태창처럼 봇마다 다른 노이즈를 요약 모델과 하이브리드 검색 쿼리에 보내기 전에 지웁니다. 실제 저장 원문·RP 요청·원문 변경 감지는 바꾸지 않습니다. 적용 순서는 입력 정리 → {{user}}/{{char}} 치환 → 아래 규칙 순이며, 규칙은 입력 정리 사용 여부와 관계없이 켠 것만 적용합니다. 일치한 부분을 빈 문자열로 바꿉니다.</p>
+      <p>최대 ${C.FILTER_LIMIT}개 · 패턴 ${C.FILTER_PATTERN_LIMIT}글자 이하. 해석할 수 없는 패턴은 저장하지 않습니다. 실행 중 오류가 난 규칙은 그 규칙만 건너뜁니다. (a+)+ 같은 중첩 반복은 기기를 멈추게 할 수 있어 경고하지만 모든 위험 패턴을 찾아내지는 못합니다.</p>
+      <div id="filterRows"></div><small id="filterCount"></small>
+      <div class="row"><button id="addFilter" class="secondary">제거 규칙 추가</button></div>
+      <label>미리보기 샘플 텍스트 · 제거 전<textarea id="filterSample" rows="4" placeholder="예: 그녀가 웃었다. [OOC: 다음 장면으로]"></textarea></label>
+      <div class="row"><button id="previewFilters" class="secondary">제거 결과 미리보기</button></div>
+      <label>제거 후<textarea id="filterResult" rows="4" readonly></textarea></label><small id="filterState" style="white-space:pre-wrap"></small></details>
       <p>구간 본문 권장 목표 = 요약 주기 × 해당 모드의 턴당 평균 글자 수. 중요한 사실·추가 지침 때문에 목표를 넘겨도 정상 요약은 자르거나 버리지 않고 저장합니다. 날짜·시간 표시와 제목·키워드는 본문 목표에서 제외합니다. 한 턴마다 같은 분량을 강제하지 않습니다. JSON 오류·잘못된 턴 범위·빈 본문·응답 잘림은 실패로 처리합니다. 단독·자체 하이브리드는 미요약 원문을 더 남기며, 병행의 원문 보존은 Risu 설정을 따릅니다.</p>
       <p>입력 정리는 알려진 표시용 장식을 정리하며 상태 JSON·사용자 정의 태그의 의미를 해석하지 않습니다. 정리를 끄면 원문 그대로 요약합니다. 작품별 상태 해석·언어·기록 우선순위는 추가 요약 지침에 적으세요. 원본 저장·전체 원문 변경 감지는 유지합니다.</p>
       <p>1턴 = 완료된 AI 응답 1개. 사용자 입력 없이 별도 메시지로 진행해도 각각 셉니다. 첫 인사와 같은 메시지의 이어쓰기·재생성은 추가 턴이 아닙니다. <strong>단독·자체 하이브리드는 Risu 내장 기억을 끄고, Risu 기억 병행은 하이파 등 내장 기억을 직접 켜세요.</strong> 병행에서는 자체 자동 검색·원문 자르기를 하지 않습니다.</p>
@@ -737,6 +787,9 @@
       <div class="row"><button id="reloadCaches" class="secondary">목록 새로고침</button><button id="reuseCache" class="secondary">선택 기록의 공통 구간 불러오기</button><button id="deleteCache" class="secondary">선택 기록 삭제</button><button id="deleteCurrent" class="secondary">현재 채팅 기억 삭제</button><button id="deleteAllCaches" class="secondary">전체 기억 삭제</button></div>
       <p>백업의 원문 일치 검사는 요약 내용의 진실성·작성자를 인증하지 않습니다. 신뢰할 수 있는 백업만 복원하세요. 캐시는 대화를 이동해도 남습니다. Risu 저장 데이터를 초기화하거나 별도 저장본으로 바꾸면 달라질 수 있으므로 중요한 기록은 JSON 백업도 보관하세요. 삭제 후에도 자동 요약을 계속 사용하면 이후 기록은 다시 생성됩니다.</p></section>`);
     for(const key of Object.keys(C.DEFAULTS)) {if(!$(key)) continue; if(['enabled','allowPlugins','autoRestoreCache','cleanSummaryInput','embeddingReuseCredential'].includes(key)) $(key).checked=s[key];else $(key).value=s[key];}
+    renderFilters(s.inputFilters);
+    $('addFilter').onclick=()=>{const rows=currentFilterRows();if(rows.length<C.FILTER_LIMIT)renderFilters([...rows,{pattern:'',flags:'g',enabled:true}]);};
+    $('previewFilters').onclick=()=>{try{previewFilters();}catch(e){$('filterState').textContent=P.safeError(e);notify(e.message);}};
     modeControls();$('mode').onchange=modeControls;$('risuLogScope').onchange=modeControls;$('hybridLogScope').onchange=modeControls;
     $('promptPreset').onchange=()=>{clearPromptDelete();$('promptPresetName').value=$('promptPreset').value;};
     action('loadPromptPreset',async()=>{

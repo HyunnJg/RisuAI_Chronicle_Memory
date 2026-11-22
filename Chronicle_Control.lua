@@ -9,7 +9,8 @@ local fields = {
   tokens = "chronicle_tokens",
   batches = "chronicle_batches",
   risu_chars = "chronicle_risu_chars",
-  risu_chunks = "chronicle_risu_chunks"
+  risu_chunks = "chronicle_risu_chunks",
+  hybrid_chunks = "chronicle_hybrid_chunks"
 }
 
 local function readSetting(id, name)
@@ -33,6 +34,10 @@ function onStart(id)
   setChatVar(id, "chronicle_raw_trim", enabled ~= "1" and "inherit" or trim == "1" and "rolling" or trim == "2" and "chunk" or "inherit")
   local scope = readSetting(id, "risu_scope")
   setChatVar(id, "chronicle_risu_scope", enabled ~= "1" and "inherit" or scope == "1" and "all" or scope == "2" and "recent" or scope == "3" and "none" or "inherit")
+  local hybridScope = readSetting(id, "hybrid_scope")
+  setChatVar(id, "chronicle_hybrid_scope", enabled ~= "1" and "inherit" or hybridScope == "1" and "all" or hybridScope == "2" and "recent" or "inherit")
+  local blocking = readSetting(id, "blocking")
+  setChatVar(id, "chronicle_blocking", enabled ~= "1" and "inherit" or blocking == "1" and "wait" or blocking == "2" and "nonblocking" or "inherit")
   local clean = readSetting(id, "clean")
   setChatVar(id, "chronicle_clean", enabled ~= "1" and "inherit" or clean == "1" and "1" or clean == "2" and "0" or "inherit")
 end

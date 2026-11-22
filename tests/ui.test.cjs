@@ -162,3 +162,7 @@ test('v0.8.0 settings reject invalid removal patterns, preview removals, and war
   h.all.filter(e=>e.textContent==='이 규칙 삭제')[1].onclick();h.get('addFilter').onclick();assert.equal(rows().length,2);
   await h.click('saveSettings');assert.deepEqual(JSON.parse(h.store.get('risu-chronicle:v1:settings')).inputFilters.map(r=>r.pattern),['\\[OOC[^\\]]*\\]']);
 });
+test('v0.8.0 settings screen shows the package version',async()=>{
+  const h=await setup();await h.open();
+  assert.match(fs.readFileSync(path.join(__dirname,'../Chronicle_Memory.js'),'utf8'),new RegExp(`<small>v${require('../package.json').version.replace(/\./g,'\\.')}</small>`));
+});

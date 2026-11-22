@@ -747,3 +747,11 @@ test('v0.8.0 nonblocking keeps the in-progress range as raw under both rolling a
     model.gates[1].resolve();await until(()=>coveredOf(h)===10);
   }
 });
+test('v0.8.0 runtime uses a stored v0.7.9 state without re-summarizing and injects the same log',async()=>{
+  const old=JSON.parse(fs.readFileSync(path.join(__dirname,'fixtures/upgrade_v0.7.9.json'),'utf8'));
+  const store=new Map([['risu-chronicle:v1:settings',JSON.stringify(old.settings)],['risu-chronicle:v1:chat:character-1:chat-1',JSON.stringify(old.state)]]);
+  const h=await setup({}, {store});h.char.chats[0].message=old.message;
+  const out=await h.hooks.beforeRequest(formatted(old.message),'model');
+  assert.equal(h.calls.length,0);assert.equal(out.find(m=>m.memo===C.MARK).content,old.memory.hybrid);
+  assert.deepEqual(h.getState().entries,old.state.entries);assert.deepEqual(h.getState().archive,old.state.archive);
+});

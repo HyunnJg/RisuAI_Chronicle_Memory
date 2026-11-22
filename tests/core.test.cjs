@@ -526,3 +526,22 @@ test('v0.8.0 removal patterns are validated, capped, applied in order and skippe
   assert.equal(C.summaryInput(tl.turns,{...s,cleanSummaryInput:false},{charName:'리아'})[0].messages[0].content,'<div>음. {{char}}: 안녕</div>');
   assert.equal(tl.turns[0].messages[0].data,'<div>음. {{char}}: 안녕</div>');
 });
+test('v0.8.0 reads v0.7.9 settings, state and backups and renders the same memory',async()=>{
+  const old=JSON.parse(fs.readFileSync(path.join(__dirname,'fixtures/upgrade_v0.7.9.json'),'utf8'));
+  const s=C.settings(old.settings);
+  assert.equal(s.summaryContext,'previous');assert.equal(s.hybridLogScope,'all');assert.equal(s.hybridRecentChunks,10);
+  assert.equal(s.summaryBlocking,'wait');assert.deepEqual(s.inputFilters,[]);
+  const state=C.validateState(old.state),tl=await C.timeline(old.message);
+  assert.deepEqual(C.reconcile(state,tl).entries,state.entries);
+  for(const mode of ['standalone','hybrid','risu'])assert.equal(C.memoryText(state,C.settings({...old.settings,mode})),old.memory[mode],mode);
+  const messages=[{role:'system',content:'규칙'},...old.message.map(m=>({role:m.role==='char'?'assistant':'user',content:m.data,memo:m.chatId}))];
+  assert.deepEqual(C.inject(messages,state,tl,C.settings({...old.settings,mode:'standalone'})),old.inject);
+  const restored=C.restoreState(C.emptyState(),old.backup.state,tl);
+  assert.equal(restored.changed,true);assert.deepEqual(restored.state.entries,old.state.entries);
+  assert(restored.state.archive.some(row=>row.entries.some(e=>e.id==='old-entry')));
+  assert.equal(C.restoreState(restored.state,old.backup.state,tl).changed,false);
+  // A v0.7.x Control module sets none of the new chat variables: plugin values apply.
+  const chat={scriptstate:{$chronicle_enabled:'1',$chronicle_interval:'5',$chronicle_mode:'hybrid',$chronicle_risu_scope:'inherit',$chronicle_budget:'inherit',$chronicle_timeout:'inherit'}};
+  const resolved=C.chatSettings({...old.settings,hybridLogScope:'recent',summaryBlocking:'nonblocking'},chat);
+  assert.equal(resolved.hybridLogScope,'recent');assert.equal(resolved.summaryBlocking,'nonblocking');assert.deepEqual(resolved.settingWarnings,[]);
+});

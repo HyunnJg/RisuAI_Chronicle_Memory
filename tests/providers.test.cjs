@@ -142,4 +142,12 @@ test('built risum contains native settings and captions with no display injectio
   assert(!obj.module.customModuleToggle.includes('chronicle_ctl_timeout='));assert(!obj.module.customModuleToggle.includes('chronicle_ctl_budget='));assert.match(obj.module.customModuleToggle,/chronicle_ctl_clean=.*=select/);
   assert.equal(obj.module.trigger[0].type,'start');assert.match(obj.module.trigger[0].effect[0].code,/getGlobalVar/);
   assert.match(obj.module.trigger[0].effect[0].code,/setChatVar/);assert(!obj.module.trigger[0].effect[0].code.includes('nativeFetch'));
+  // v0.8.0 per-chat options map onto CHAT_KEYS; select index 0 always inherits the plugin value.
+  assert.match(obj.module.customModuleToggle,/chronicle_ctl_hybrid_scope=.*=select=플러그인 기본값,누적 로그 전체,최근 K청크/);
+  assert.match(obj.module.customModuleToggle,/chronicle_ctl_hybrid_chunks=.*=text/);
+  assert.match(obj.module.customModuleToggle,/chronicle_ctl_blocking=.*=select=플러그인 기본값,기다림[^,]*,기다리지 않음/);
+  const code=obj.module.trigger[0].effect[0].code;
+  assert.match(code,/hybrid_chunks = "chronicle_hybrid_chunks"/);assert.match(code,/hybridScope == "2" and "recent"/);assert.match(code,/blocking == "2" and "nonblocking"/);
+  for(const key of ['chronicle_hybrid_scope','chronicle_hybrid_chunks','chronicle_blocking'])assert(Object.values(require('../core.cjs').CHAT_KEYS).includes(key),key);
+  assert(!obj.module.customModuleToggle.split('\n').some(line=>line.endsWith('=caption')&&line.slice(0,-8).split('=').length!==2),'captions must not contain =');
 });

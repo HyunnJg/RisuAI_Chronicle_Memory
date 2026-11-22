@@ -18,20 +18,45 @@ test('OpenAI-compatible embeddings use float vectors and restore the documented 
   const body=JSON.parse(h.calls[0].options.body);assert.equal(body.encoding_format,'float');assert.deepEqual(body.input,['문서 A','문서 B']);assert.equal(body.model,'org/embed');
   assert.equal(h.calls[0].options.headers.Authorization,'Bearer EMBED_SECRET');
 });
-test('Gemini embeddings separate retrieval query/document tasks and modern prompt instructions',async()=>{
+test('Gemini AI Studio embeddings use batchEmbedContents with per-request retrieval tasks and modern instructions',async()=>{
   const cfg=C.settings({embeddingProvider:'gemini',embeddingModel:'gemini-embedding-001'});
-  const h=transport([{body:{embedding:{values:[1,0]}}},{body:{embedding:{values:[0,1]}}},{body:{embedding:{values:[1,1]}}}]);
+  const h=transport([{body:{embeddings:[{values:[1,0]}]}},{body:{embeddings:[{values:[0,1]}]}},{body:{embeddings:[{values:[1,1]}]}}]);
   await P.embed(h.api,cfg,'AIS_KEY',['문서']);await P.embed(h.api,cfg,'AIS_KEY',['질의'],'query');
   await P.embed(h.api,{...cfg,embeddingModel:'gemini-embedding-2'},'AIS_KEY',['질의'],'query');
-  assert.equal(JSON.parse(h.calls[0].options.body).embedContentConfig.taskType,'RETRIEVAL_DOCUMENT');
-  assert.equal(JSON.parse(h.calls[1].options.body).embedContentConfig.taskType,'RETRIEVAL_QUERY');
-  assert.equal(h.calls[0].options.headers['x-goog-api-key'],'AIS_KEY');assert.match(h.calls[0].url,/:embedContent$/);
-  const modern=JSON.parse(h.calls[2].options.body);assert(!('taskType'in modern.embedContentConfig));assert.match(modern.content.parts[0].text,/Represent this search query/);assert.equal(modern.embedContentConfig.autoTruncate,false);
+  const [doc,query,modern]=h.calls.map(c=>JSON.parse(c.options.body).requests[0]);
+  assert.deepEqual(doc,{model:'models/gemini-embedding-001',content:{parts:[{text:'문서'}]},taskType:'RETRIEVAL_DOCUMENT'});
+  assert.equal(query.taskType,'RETRIEVAL_QUERY');
+  assert.equal(h.calls[0].options.headers['x-goog-api-key'],'AIS_KEY');assert.match(h.calls[0].url,/\/models\/gemini-embedding-001:batchEmbedContents$/);
+  // Vertex-only fields are never sent to AI Studio.
+  for(const row of [doc,query,modern])assert(!('embedContentConfig' in row)&&!('autoTruncate' in row));
+  assert(!('taskType' in modern));assert.match(modern.content.parts[0].text,/Represent this search query/);
+});
+test('v0.8.0 Gemini batches split at 100 inputs, keep order, and reject count mismatches',async()=>{
+  const cfg=C.settings({embeddingProvider:'gemini',embeddingModel:'gemini-embedding-001'});
+  const texts=Array.from({length:150},(_,i)=>`문서 ${i}`),vector=i=>[i+1,1];
+  const h=transport([{body:{embeddings:texts.slice(0,100).map((_,i)=>({values:vector(i)}))}},{body:{embeddings:texts.slice(100).map((_,i)=>({values:vector(100+i)}))}}]);
+  const out=await P.embed(h.api,cfg,'AIS_KEY',texts);
+  assert.equal(h.calls.length,2);assert.deepEqual(h.calls.map(c=>JSON.parse(c.options.body).requests.length),[100,50]);
+  assert.equal(JSON.parse(h.calls[1].options.body).requests[0].content.parts[0].text,'문서 100');
+  assert.deepEqual(out,texts.map((_,i)=>vector(i)));
+  let bad=transport([{body:{embeddings:[{values:[1,0]}]}}]);await assert.rejects(()=>P.embed(bad.api,cfg,'AIS_KEY',['가','나']),/개수/);
+  bad=transport([{body:{embeddings:texts.slice(0,100).map(()=>({values:[1,0]}))}},{body:{embeddings:[{values:[1,0]}]}}]);
+  await assert.rejects(()=>P.embed(bad.api,cfg,'AIS_KEY',texts),/개수/);assert.equal(bad.calls.length,2);
+  bad=transport([{body:{}}]);await assert.rejects(()=>P.embed(bad.api,cfg,'AIS_KEY',['가']),/개수/);
+});
+test('v0.8.0 Vertex embeddings stay one request per input',async()=>{
+  const {privateKey}=crypto.generateKeyPairSync('rsa',{modulusLength:2048});
+  const sa=JSON.stringify({type:'service_account',project_id:'p',client_email:'a@p.iam.gserviceaccount.com',private_key:privateKey.export({type:'pkcs8',format:'pem'}),token_uri:'https://oauth2.googleapis.com/token'});
+  const h=transport([{body:{access_token:'TOKEN',expires_in:3600}},{body:{predictions:[{embeddings:{values:[1,0]}}]}},{body:{predictions:[{embeddings:{values:[0,1]}}]}},{body:{predictions:[{embeddings:{values:[1,1]}}]}}]);
+  const cfg=C.settings({embeddingProvider:'vertex',embeddingModel:'gemini-embedding-001',embeddingLocation:'us-central1',embeddingProject:'p'});
+  assert.deepEqual(await P.embed(h.api,cfg,sa,['a','b','c']),[[1,0],[0,1],[1,1]]);
+  assert.equal(h.calls.filter(c=>/:predict$/.test(c.url)).length,3);
+  for(const call of h.calls.slice(1))assert.equal(JSON.parse(call.options.body).instances.length,1);
 });
 test('invalid vectors, missing indices, truncation and HTTP errors are explicit and redact credentials',async()=>{
   for(const vectors of [[],[[0,0]],[[NaN,1]],[[1,0],[1]],['encoded']])assert.throws(()=>P.checkVectors(vectors,1));
   const cfg=C.settings({embeddingProvider:'gemini',embeddingModel:'test-embed'});
-  let h=transport([{body:{truncated:true,embedding:{values:[1,0]}}}]);await assert.rejects(()=>P.embed(h.api,cfg,'TEST_SECRET',['문서']),/잘렸/);
+  let h=transport([{body:{embeddings:[{values:[1,0],truncated:true}]}}]);await assert.rejects(()=>P.embed(h.api,cfg,'TEST_SECRET',['문서']),/잘렸/);
   h=transport([{status:401,body:{error:{message:'Invalid TEST_SECRET'}}}]);await assert.rejects(()=>P.embed(h.api,cfg,'TEST_SECRET',['문서']),e=>/401/.test(e.message)&&!e.message.includes('TEST_SECRET'));
   h=transport([{body:{data:[{index:1,embedding:[1,0]}]}}]);await assert.rejects(()=>P.embed(h.api,{...cfg,embeddingProvider:'openai'},'KEY',['문서']),/인덱스/);
 });

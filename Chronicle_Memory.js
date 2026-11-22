@@ -721,6 +721,14 @@ const ChronicleProviders=(()=>{
     const content=modern?(kind==='query'?'Represent this search query for retrieving relevant roleplay event records: ':'Represent this roleplay event record for retrieval: ')+text:text;
     return {content:{parts:[{text:content}]},embedContentConfig:{autoTruncate:false,...(!modern&&model!=='embedding-001'?{taskType:kind==='query'?'RETRIEVAL_QUERY':'RETRIEVAL_DOCUMENT'}:{})}};
   }
+  // AI Studio (Gemini Developer API) request item: taskType sits on the request itself;
+  // embedContentConfig/autoTruncate belong to the Vertex embedContent shape only.
+  function embeddingGeminiRequest(model,text,kind){
+    const modern=/^gemini-embedding-2(?:$|[-@])/.test(model);
+    const content=modern?(kind==='query'?'Represent this search query for retrieving relevant roleplay event records: ':'Represent this roleplay event record for retrieval: ')+text:text;
+    return {model:'models/'+model,content:{parts:[{text:content}]},...(!modern&&model!=='embedding-001'?{taskType:kind==='query'?'RETRIEVAL_QUERY':'RETRIEVAL_DOCUMENT'}:{})};
+  }
+  const GEMINI_BATCH_LIMIT=100;
   async function embed(api,s,credential,texts,kind='document'){
     if(!Array.isArray(texts)||!texts.length||texts.some(t=>typeof t!=='string'||!t.trim()))throw Error('임베딩할 텍스트가 없습니다.');
     const provider=s.embeddingProvider,model=modelID(s.embeddingModel),headers={'Content-Type':'application/json'};
@@ -747,17 +755,24 @@ const ChronicleProviders=(()=>{
       headers.Authorization='Bearer '+auth.token;
     }else throw Error('지원하지 않는 임베딩 제공자');
     const vectors=[];
-    // One input per request also supports Vertex models that accept a single instance.
-    for(const text of texts){
-      let url,body;
-      if(provider==='gemini'){
-        url='https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':embedContent';
-        body=embeddingGoogleBody(model,text,kind);
-      }else{
-        const method=s.embeddingVertexMethod;
-        url=vertexHost(s.embeddingLocation)+'/v1/projects/'+encodeURIComponent(project)+'/locations/'+s.embeddingLocation+'/publishers/google/models/'+encodeURIComponent(model)+':'+method;
-        body=method==='predict'?{instances:[{content:text,task_type:kind==='query'?'RETRIEVAL_QUERY':'RETRIEVAL_DOCUMENT'}],parameters:{autoTruncate:false}}:embeddingGoogleBody(model,text,kind);
+    if(provider==='gemini'){
+      // batchEmbedContents keeps bulk re-indexing under per-minute request limits; responses
+      // carry no index, so each batch must return exactly its inputs in order.
+      const url='https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':batchEmbedContents';
+      for(let start=0;start<texts.length;start+=GEMINI_BATCH_LIMIT){
+        const part=texts.slice(start,start+GEMINI_BATCH_LIMIT);
+        const data=await request(api,url,{method:'POST',headers,body:JSON.stringify({requests:part.map(text=>embeddingGeminiRequest(model,text,kind))})},[credential]);
+        if(!Array.isArray(data.embeddings)||data.embeddings.length!==part.length)throw Error('임베딩 응답 개수 오류');
+        if(data.truncated||data.embeddings.some(row=>row?.truncated||row?.statistics?.truncated))throw Error('임베딩 입력이 잘렸습니다. 청크 분량이나 모델을 확인하세요.');
+        vectors.push(...data.embeddings.map(row=>row?.values));
       }
+      return checkVectors(vectors,texts.length);
+    }
+    // Vertex stays one input per request: some models (e.g. gemini-embedding-001) accept a single instance.
+    for(const text of texts){
+      const method=s.embeddingVertexMethod;
+      const url=vertexHost(s.embeddingLocation)+'/v1/projects/'+encodeURIComponent(project)+'/locations/'+s.embeddingLocation+'/publishers/google/models/'+encodeURIComponent(model)+':'+method;
+      const body=method==='predict'?{instances:[{content:text,task_type:kind==='query'?'RETRIEVAL_QUERY':'RETRIEVAL_DOCUMENT'}],parameters:{autoTruncate:false}}:embeddingGoogleBody(model,text,kind);
       const data=await request(api,url,{method:'POST',headers,body:JSON.stringify(body)},[credential,auth?.token]);
       if(data.truncated||data.predictions?.[0]?.embeddings?.statistics?.truncated)throw Error(' 임베딩 입력이 잘렸습니다. 청크 분량이나 모델을 확인하세요.');
       vectors.push(data.embedding?.values||data.predictions?.[0]?.embeddings?.values);
@@ -791,7 +806,7 @@ const ChronicleProviders=(()=>{
     return [...new Map(result.map(m=>[m.id,m])).values()].sort((a,b)=>a.id.localeCompare(b.id));
   }
   return {NATIVE,LABELS,defaults,compatibleURL,safeError,credentialRecord,credentialOrigin,bindCredential,credentialSecret,serviceAccount,vertexToken,googleBody,claudeBody,nativeText,complete,models,
-    embeddingURL,isVoyageURL,isVoyageEmbedding,canReuseExternalCredential,VOYAGE_MODELS,checkVectors,embeddingGoogleBody,embed,embeddingModels};
+    embeddingURL,isVoyageURL,isVoyageEmbedding,canReuseExternalCredential,VOYAGE_MODELS,checkVectors,embeddingGoogleBody,embeddingGeminiRequest,GEMINI_BATCH_LIMIT,embed,embeddingModels};
 })();
 if(typeof module!=='undefined'&&module.exports)module.exports=ChronicleProviders;
 

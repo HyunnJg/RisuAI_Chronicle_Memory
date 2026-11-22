@@ -199,7 +199,18 @@ const ChronicleCore = (() => {
       return result.replace(/\u0000CHRONICLE_DATA_(\d+)\u0000/g,(_,i)=>protectedBlocks[Number(i)]);
     }
     return batch.map((t,i)=>({turn:t.number,...(i===0 && context.charName?{context:{botCardName:context.charName}}:{}),
-      messages:t.messages.map(m=>({role:m.role==='user'?'user':'assistant',...(m.saying?{speaker:m.saying}:{}),content:s.cleanSummaryInput?clean(m.data):m.data}))}));
+      messages:t.messages.map(m=>({role:m.role==='user'?'user':'assistant',...(m.saying?{speaker:m.saying}:{}),content:inputText(s.cleanSummaryInput?clean(m.data):m.data,s,context)}))}));
+  }
+  // The persona name needs Risu's separate database permission, so it is used only when a
+  // caller supplies it; otherwise {{user}} becomes a neutral label instead of a guess.
+  function substituteNames(text,context={}){
+    const name=value=>typeof value==='string'&&value.trim()?value.trim():'';
+    const user=name(context.userName)||'사용자',char=name(context.charName)||'캐릭터';
+    return String(text).replace(/\{\{(user|char)\}\}/gi,(_,key)=>key.toLowerCase()==='user'?user:char);
+  }
+  // Summary/search input only. Hashes and stored source messages never pass through here.
+  function inputText(text,s,context={}){
+    return s.cleanSummaryInput?substituteNames(text,context):String(text);
   }
   const summaryPerTurn=s=>s.mode==='risu'?s.risuCharsPerTurn:s.charsPerTurn;
   const summaryTarget=(s,turnCount=1)=>summaryPerTurn(s)*turnCount;
@@ -382,6 +393,6 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;

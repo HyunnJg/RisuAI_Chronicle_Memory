@@ -208,7 +208,18 @@ const ChronicleCore = (() => {
       return result.replace(/\u0000CHRONICLE_DATA_(\d+)\u0000/g,(_,i)=>protectedBlocks[Number(i)]);
     }
     return batch.map((t,i)=>({turn:t.number,...(i===0 && context.charName?{context:{botCardName:context.charName}}:{}),
-      messages:t.messages.map(m=>({role:m.role==='user'?'user':'assistant',...(m.saying?{speaker:m.saying}:{}),content:s.cleanSummaryInput?clean(m.data):m.data}))}));
+      messages:t.messages.map(m=>({role:m.role==='user'?'user':'assistant',...(m.saying?{speaker:m.saying}:{}),content:inputText(s.cleanSummaryInput?clean(m.data):m.data,s,context)}))}));
+  }
+  // The persona name needs Risu's separate database permission, so it is used only when a
+  // caller supplies it; otherwise {{user}} becomes a neutral label instead of a guess.
+  function substituteNames(text,context={}){
+    const name=value=>typeof value==='string'&&value.trim()?value.trim():'';
+    const user=name(context.userName)||'사용자',char=name(context.charName)||'캐릭터';
+    return String(text).replace(/\{\{(user|char)\}\}/gi,(_,key)=>key.toLowerCase()==='user'?user:char);
+  }
+  // Summary/search input only. Hashes and stored source messages never pass through here.
+  function inputText(text,s,context={}){
+    return s.cleanSummaryInput?substituteNames(text,context):String(text);
   }
   const summaryPerTurn=s=>s.mode==='risu'?s.risuCharsPerTurn:s.charsPerTurn;
   const summaryTarget=(s,turnCount=1)=>summaryPerTurn(s)*turnCount;
@@ -391,7 +402,7 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,summaryPerTurn,summaryTarget,summaryPrompt,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;
 
@@ -725,11 +736,12 @@ const ChronicleRetrieval=(()=>{
     const result=dot/(Math.sqrt(aa)*Math.sqrt(bb));return Number.isFinite(result)?Math.max(-1,Math.min(1,result)):null;
   }
   const document=e=>[e.title||'',e.text,(e.keywords||[]).join(' · ')].filter(Boolean).join('\n');
-  function query(tl){
+  // transform: summary-input preprocessing shared with the summarizer (names, filters).
+  function query(tl,transform=text=>text){
     const messages=tl.turns.slice(-2).flatMap(t=>t.messages).concat(tl.pending);
     return Array.from(messages.map(m=>{
-      const text=m.data.replace(/<([a-z_][\w:.-]*)\b[^>]*>\s*[\[{][\s\S]*?<\/\1\s*>/gi,'')
-        .replace(/<[^>]+>/g,' ');
+      const text=transform(m.data.replace(/<([a-z_][\w:.-]*)\b[^>]*>\s*[\[{][\s\S]*?<\/\1\s*>/gi,'')
+        .replace(/<[^>]+>/g,' '));
       const limit=tl.pending.includes(m)?2400:1200;
       return `${m.role==='user'?'사용자':'최근 상황'}: ${Array.from(text).slice(-limit).join('')}`;
     }).join('\n')).slice(-6000).join('').trim();
@@ -1185,7 +1197,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     return current;
   }
   async function recall(ctx,state,s,force=false){
-    const warnings=[],query=R.query(ctx.tl),savedIndex=await D.vectors(ctx.key);
+    const warnings=[],query=R.query(ctx.tl,text=>C.inputText(text,s,ctx)),savedIndex=await D.vectors(ctx.key);
     const index={schema:1,entries:Object.assign(Object.create(null),savedIndex.entries)};
     const signature=await C.digest([s.embeddingProvider,s.embeddingModel,s.embeddingEndpoint,s.embeddingProject,s.embeddingLocation,s.embeddingVertexMethod,P.isVoyageEmbedding(s)?'chronicle-voyage-embedding-v1':'chronicle-embedding-v1']);
     let dirty=false,vector=null,embeddingReady=false,keywordReason='';

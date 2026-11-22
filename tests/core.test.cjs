@@ -428,3 +428,18 @@ test('v0.8.0 date fields split a calendar date and time written together without
   assert.equal(parse([{date:'1073-05-18',time:'낮',summary:'그대로.'}]).text,'1073.05.18. 낮 — 그대로.');
   assert.equal(C.calendarDate('1073.5.3.'),'1073.05.03.');assert.equal(C.calendarDate('다음 날'),'');assert.equal(C.calendarDate('2026-13-01'),null);
 });
+test('v0.8.0 summary input replaces {{user}}/{{char}} case-insensitively without touching source hashes',async()=>{
+  const source=[{role:'user',data:'{{user}}가 {{CHAR}}에게 묻는다. {{User}}?',chatId:'u1'},{role:'char',data:'{{char}}는 {{user}}에게 답한다. {{getvar::x}}',chatId:'a1'}];
+  const before=await C.timeline(source),batch=before.turns;
+  const input=C.summaryInput(batch,C.settings({}),{charName:'리아'});
+  assert.equal(input[0].messages[0].content,'사용자가 리아에게 묻는다. 사용자?');
+  assert.equal(input[0].messages[1].content,'리아는 사용자에게 답한다. {{getvar::x}}');
+  assert.equal(C.summaryInput(batch,C.settings({}),{charName:'리아',userName:'  민준 '})[0].messages[0].content,'민준가 리아에게 묻는다. 민준?');
+  assert.equal(C.substituteNames('{{char}} $& {{user}}',{charName:'$1',userName:'$&'}),'$1 $& $&');
+  assert.equal(C.substituteNames('{{char}}와 {{user}}',{}),'캐릭터와 사용자');
+  // Turned off together with input cleanup.
+  assert.equal(C.summaryInput(batch,C.settings({cleanSummaryInput:false}),{charName:'리아'})[0].messages[0].content,source[0].data);
+  const after=await C.timeline(source);
+  assert.deepEqual(after.turns.map(t=>[t.hash,t.contentHash]),before.turns.map(t=>[t.hash,t.contentHash]));
+  assert.equal(after.fingerprint,before.fingerprint);assert.equal(source[0].data,'{{user}}가 {{CHAR}}에게 묻는다. {{User}}?');
+});

@@ -604,3 +604,9 @@ test('legacy inline vectors migrate without re-summarizing, and archives no long
   assert.equal(h.calls.length,nativeCalls);assert(!C.hasDerivedState(h.getState()));
   assert.deepEqual(h.getVectors().entries[e.id].vector,[1,0]);assert.equal(h.getState().entries[0].text,e.text);
 });
+test('v0.8.0 summary requests use the card name for {{char}} and a neutral label for {{user}}',async()=>{
+  const h=await setup();h.char.chats[0].message[1].data='{{char}}가 {{user}}의 손을 잡았다.';
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.match(h.calls[0].messages[1].content,/테스트 캐릭터가 사용자의 손을 잡았다/);
+  assert.equal(h.getState().entries[0].hash,(await C.timeline(h.char.chats[0].message)).turns[4].hash);
+});

@@ -47,3 +47,11 @@ test('hybrid re-exposes selected summaries near current input and remains idempo
   assert.deepEqual(C.inject(out,state,tl,s,()=>{},recall),out);
   assert(!C.inject(input,state,tl,C.settings(),()=>{},recall).some(m=>m.memo===C.MARK+'-recall'));
 });
+test('v0.8.0 recall query applies the shared summary-input transform only to the query text',async()=>{
+  const C=require('../core.cjs');
+  const tl=await C.timeline([{role:'user',data:'{{user}}는 {{char}}와 약속했다.',chatId:'u1'},{role:'char',data:'{{char}}가 웃었다.',chatId:'a1'},{role:'user',data:'{{USER}}: 다음',chatId:'u2'}]);
+  const q=R.query(tl,text=>C.inputText(text,C.settings({}),{charName:'리아'}));
+  assert(!/\{\{/.test(q));assert.match(q,/사용자는 리아와 약속했다/);assert.match(q,/사용자: 다음/);
+  assert.match(R.query(tl,text=>C.inputText(text,C.settings({cleanSummaryInput:false}),{charName:'리아'})),/\{\{user\}\}/);
+  assert.equal(R.query(tl),R.query(tl,text=>text));
+});

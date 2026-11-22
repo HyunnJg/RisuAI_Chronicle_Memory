@@ -638,3 +638,17 @@ test('v0.8.0 after a user re-summary only the replacement chunk is embedded agai
   assert.deepEqual(documents.map(d=>d.length),[1]);assert.match(documents[0][0],/새 기록/);
   const vectors=h.getVectors().entries;assert(!(old.id in vectors));assert.equal(Object.keys(vectors).length,3);
 });
+test('v0.8.0 hybrid recent scope leaves old chunks out of the log block and offers them through recall',async()=>{
+  const titled=opts=>{const rows=turnsOf(opts.messages[1].content),from=rows[0].turn;
+    return {type:'success',result:JSON.stringify({from,to:rows.at(-1).turn,title:`구간${from}`,keywords:[`단서${from}`],events:[{summary:`T${from} 기록`}]})};};
+  const h=await setup({mode:'hybrid',hybridLogScope:'recent',hybridRecentChunks:1,batchesPerRequest:4,embeddingModel:''},{onCall:titled});
+  h.char.chats[0].message=raw(20);h.char.chats[0].message.at(-1).data='단서1 이야기를 다시 꺼낸다.';
+  const out=await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert.equal(C.covered(h.getState()),20);
+  const log=out.find(m=>m.memo===C.MARK).content,recall=out.find(m=>m.memo===C.MARK+'-recall')?.content||'';
+  assert(log.includes('구간16 (16–20턴)'));assert(!log.includes('구간1 (1–5턴)'));assert.match(log,/생략했다/);
+  assert(recall.includes('구간1 (1–5턴)'));assert.deepEqual(h.getRecall().selected.map(r=>r.from),[1]);
+  const all=await setup({mode:'hybrid',batchesPerRequest:4,embeddingModel:''},{onCall:titled});all.char.chats[0].message=raw(20);
+  const full=await all.hooks.beforeRequest(formatted(all.char.chats[0].message),'model');
+  assert(full.find(m=>m.memo===C.MARK).content.includes('구간1 (1–5턴)'));assert(!full.find(m=>m.memo===C.MARK).content.includes('생략했다'));
+});

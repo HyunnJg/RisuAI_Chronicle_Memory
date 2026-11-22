@@ -485,3 +485,21 @@ test('v0.8.0 resummarizable requires present, unchanged source turns and replace
   assert.doesNotThrow(()=>C.validateState(next));assert.equal(state.entries[0].text,'첫 기록');
   assert.throws(()=>C.replaceEntry(state,a.id,tl.turns.slice(0,4),{title:'',keywords:[],text:'x'}),/일치하지 않습니다/);
 });
+test('v0.8.0 hybrid log scope injects recent K chunks only in hybrid and keeps all identical to v0.7.9',async()=>{
+  const tl=await C.timeline(raw(20));let state=C.emptyState();
+  for(let i=0;i<4;i++)state=C.commit(state,tl.turns.slice(i*5,i*5+5),{title:`구간 ${i+1}`,keywords:[],text:`기록 ${i+1}`,warnings:[]});
+  const all=C.settings({mode:'hybrid'}),recent=C.settings({mode:'hybrid',hybridLogScope:'recent',hybridRecentChunks:2});
+  assert.equal(all.hybridLogScope,'all');assert.equal(all.hybridRecentChunks,10);
+  assert.equal(C.memoryText(state,all),C.memoryText(state,C.settings({mode:'standalone'})));
+  assert.deepEqual(C.injectedEntries(state,recent).map(e=>e.from),[11,16]);
+  const text=C.memoryText(state,recent);
+  assert(!text.includes('구간 1 (')&&!text.includes('구간 2 ('));assert(text.includes('구간 3 (11–15턴)'));
+  assert.match(text,/T1–T10의 오래된 기록 2청크는 생략했다/);
+  // Standalone ignores the hybrid option; K larger than the log injects everything without the note.
+  assert.equal(C.memoryText(state,C.settings({mode:'standalone',hybridLogScope:'recent',hybridRecentChunks:1})),C.memoryText(state,all));
+  assert.equal(C.memoryText(state,C.settings({mode:'hybrid',hybridLogScope:'recent',hybridRecentChunks:10})),C.memoryText(state,all));
+  for(const bad of [{hybridLogScope:'none'},{hybridRecentChunks:0},{hybridRecentChunks:101}])assert.throws(()=>C.settings(bad));
+  const chat={scriptstate:{$chronicle_hybrid_scope:'recent',$chronicle_hybrid_chunks:'3'}};
+  const resolved=C.chatSettings({mode:'hybrid'},chat);assert.equal(resolved.hybridLogScope,'recent');assert.equal(resolved.hybridRecentChunks,3);
+  assert.equal(C.chatSettings({mode:'hybrid'},{scriptstate:{$chronicle_hybrid_scope:'bogus'}}).hybridLogScope,'all');
+});

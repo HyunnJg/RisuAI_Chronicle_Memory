@@ -256,6 +256,14 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     if(candidates.length!==1||start>=0||/<(?:think|thoughts?|reasoning)\b/i.test(text.slice(0,text.indexOf('{'))))throw Error('요약 JSON 해석 실패 또는 여러 요약 객체가 반환됐습니다. 원문을 유지합니다.');
     return {data:candidates[0],cleaned:true};
   }
+  // '' = not a numeric Y-M-D expression, null = numeric but not a real calendar date.
+  function calendarDate(text){
+    const match=String(text).match(/^(\d{1,4})[.\/-](\d{1,2})[.\/-](\d{1,2})\.?$/);
+    if(!match)return '';
+    const [year,month,day]=match.slice(1).map(Number),check=new Date(0);check.setUTCFullYear(year,month-1,day);
+    if(check.getUTCFullYear()!==year||check.getUTCMonth()!==month-1||check.getUTCDate()!==day)return null;
+    return `${match[1]}.${String(month).padStart(2,'0')}.${String(day).padStart(2,'0')}.`;
+  }
   function parseSummary(responseText,batch,s) {
     if (typeof responseText!=='string') throw Error('요약 응답이 문자열이 아닙니다.');
     const {data,cleaned}=summaryJSON(responseText);
@@ -280,12 +288,17 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
       if(!e||typeof e.summary!=='string'||!e.summary.trim())throw Error('요약 본문이 비어 있습니다. 원문을 유지합니다.');
       const summary=e.summary.trim();summaries.push(summary);
       let date=label(e.date),time=label(e.time);
-      const match=date.match(/^(\d{1,4})[.\/-](\d{1,2})[.\/-](\d{1,2})\.?$/);
-      if(match){
-        const [year,month,day]=match.slice(1).map(Number),check=new Date(0);check.setUTCFullYear(year,month-1,day);
-        if(check.getUTCFullYear()===year&&check.getUTCMonth()===month-1&&check.getUTCDate()===day)
-          date=`${match[1]}.${String(month).padStart(2,'0')}.${String(day).padStart(2,'0')}.`;
-        else warnings.push('일반 달력으로 정규화할 수 없는 날짜를 원문 표현대로 보존했습니다.');
+      const normalized=calendarDate(date);
+      if(normalized)date=normalized;
+      else if(normalized===null)warnings.push('일반 달력으로 정규화할 수 없는 날짜를 원문 표현대로 보존했습니다.');
+      else{
+        // Models sometimes write "1073-05-18 · 낮" into date. Split only a real calendar head;
+        // relative or fictional expressions ("다음 날 · 저녁") stay exactly as written.
+        const split=date.match(/^([^·]*?)\s*·\s*(.+)$/),head=split&&calendarDate(split[1].trim());
+        if(head){
+          if(!time){date=head;time=split[2].trim();}
+          else date=`${head} · ${split[2].trim()}`;
+        }else if(split&&head===null)warnings.push('일반 달력으로 정규화할 수 없는 날짜를 원문 표현대로 보존했습니다.');
       }
       const when=[date,time].filter(Boolean).join(' ');
       return when?`${when} — ${summary}`:summary;
@@ -378,7 +391,7 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,summaryPerTurn,summaryTarget,summaryPrompt,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;
 

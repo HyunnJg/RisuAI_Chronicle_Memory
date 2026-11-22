@@ -414,3 +414,17 @@ test('portable prefix rebinds matching source IDs but stops before a divergent f
   assert.equal(restored.entries.length,1);assert.equal(restored.entries[0].hash,tl.turns[4].hash);
   assert.notEqual(restored.entries[0].hash,state.entries[0].hash);assert.equal(C.reconcile(restored,tl).entries.length,1);
 });
+test('v0.8.0 date fields split a calendar date and time written together without inventing dates',async()=>{
+  const tl=await C.timeline(raw(5)),batch=tl.turns,s=C.settings({});
+  const parse=events=>C.parseSummary(JSON.stringify({from:1,to:5,title:'기록',keywords:['약속'],events}),batch,s);
+  assert.equal(parse([{date:'1073-05-18 · 낮',time:'',summary:'출발함.'}]).text,'1073.05.18. 낮 — 출발함.');
+  assert.equal(parse([{date:'1073-05-18·밤',summary:'도착함.'}]).text,'1073.05.18. 밤 — 도착함.');
+  // An existing time is never overwritten and the date tail is never discarded.
+  assert.equal(parse([{date:'1073/5/18 · 낮',time:'정오',summary:'만남.'}]).text,'1073.05.18. · 낮 정오 — 만남.');
+  assert.equal(parse([{date:'다음 날 · 저녁',time:'',summary:'재회함.'}]).text,'다음 날 · 저녁 — 재회함.');
+  assert.equal(parse([{date:'제국력 3년 · 봄',summary:'즉위함.'}]).text,'제국력 3년 · 봄 — 즉위함.');
+  const invalid=parse([{date:'1073-02-31 · 낮',summary:'기록함.'}]);
+  assert.equal(invalid.text,'1073-02-31 · 낮 — 기록함.');assert(invalid.warnings.some(w=>w.includes('정규화할 수 없는')));
+  assert.equal(parse([{date:'1073-05-18',time:'낮',summary:'그대로.'}]).text,'1073.05.18. 낮 — 그대로.');
+  assert.equal(C.calendarDate('1073.5.3.'),'1073.05.03.');assert.equal(C.calendarDate('다음 날'),'');assert.equal(C.calendarDate('2026-13-01'),null);
+});

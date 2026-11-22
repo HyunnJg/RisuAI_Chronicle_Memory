@@ -7,7 +7,8 @@
     "pretest": "node build.cjs",
     "test": "node --test tests/*.test.cjs",
     "build": "node build.cjs",
-    "release": "node release.cjs"
+    "release": "node release.cjs",
+    "bench": "node bench/before_request.cjs"
   },
   "license": "GPL-3.0-only",
   "author": "HyunnJg",

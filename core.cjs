@@ -12,7 +12,7 @@ const ChronicleCore = (() => {
     embeddingProvider:'gemini', embeddingModel:'', embeddingEndpoint:'', embeddingProject:'', embeddingLocation:'us-central1',
     embeddingVertexMethod:'predict', embeddingReuseCredential:true, embeddingProfiles:{},
     recallTopK:3, recallCharBudget:2200, recallMinSimilarity:0.4, embeddingBatchesPerRequest:8,
-    summaryContext:'previous', hybridLogScope:'all', hybridRecentChunks:10, inputFilters:[] });
+    summaryContext:'previous', hybridLogScope:'all', hybridRecentChunks:10, inputFilters:[], summaryBlocking:'wait' });
   function settings(input = {}) {
     if(!input||typeof input!=='object'||Array.isArray(input))throw Error('설정은 객체 형식이어야 합니다.');
     const s = { ...DEFAULTS, ...input };
@@ -29,6 +29,7 @@ const ChronicleCore = (() => {
     if (!['rolling','chunk'].includes(s.rawTrim)) throw Error('원문 자르기는 매 턴 이동 또는 청크 커밋 시 이동을 선택하세요.');
     if(!['all','recent','none'].includes(s.risuLogScope))throw Error('잘못된 Risu 병행 연대기 주입 범위');
     if(!['all','recent'].includes(s.hybridLogScope))throw Error('잘못된 하이브리드 누적 로그 주입 범위');
+    if(!['wait','nonblocking'].includes(s.summaryBlocking))throw Error('요약 대기 방식은 기다림 또는 기다리지 않음을 선택하세요.');
     if(!['previous','none'].includes(s.summaryContext))throw Error('요약 시 직전 청크 참고는 사용 또는 사용 안 함을 선택하세요.');
     if(!['openai','gemini','vertex','external','voyage'].includes(s.embeddingProvider))throw Error('임베딩 제공자를 선택하세요.');
     if(!['predict','embedContent'].includes(s.embeddingVertexMethod))throw Error('Vertex 임베딩 호출 형식을 확인하세요.');
@@ -74,7 +75,7 @@ const ChronicleCore = (() => {
     }
     return out;
   }
-  const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',rawTrim:'chronicle_raw_trim',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks',hybridLogScope:'chronicle_hybrid_scope',hybridRecentChunks:'chronicle_hybrid_chunks'};
+  const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',rawTrim:'chronicle_raw_trim',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks',hybridLogScope:'chronicle_hybrid_scope',hybridRecentChunks:'chronicle_hybrid_chunks',summaryBlocking:'chronicle_blocking'};
   function chatSettings(s,chat) {
     let resolved=settings(s); const warnings=[];
     for(const [setting,key] of Object.entries(CHAT_KEYS)) {
@@ -85,7 +86,7 @@ const ChronicleCore = (() => {
         if(setting==='enabled'||setting==='cleanSummaryInput') {
           if(!['0','1','true','false'].includes(String(value))) throw Error('채팅 기억 활성 설정 오류');
           parsed=['1','true'].includes(String(value));
-        } else parsed=['mode','risuLogScope','rawTrim','hybridLogScope'].includes(setting)?String(value):Number(value);
+        } else parsed=['mode','risuLogScope','rawTrim','hybridLogScope','summaryBlocking'].includes(setting)?String(value):Number(value);
         resolved=settings({...resolved,[setting]:parsed});
       } catch {
         warnings.push(`${key}: 잘못된 채팅 설정 대신 플러그인 기본값 ${s[setting] ?? DEFAULTS[setting]} 사용`);
@@ -396,6 +397,11 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     delete next.lastRecall;next.revision++;next.summaryWarnings=text.warnings||[];
     return next;
   }
+  // Non-blocking commits may land after newer turns or a reroll AFTER the range; the chained
+  // hash of the batch's last turn still proves every summarized source turn is unchanged.
+  function batchStillValid(batch,tl){
+    return !!batch.length&&tl.turns[batch.at(-1).number-1]?.hash===batch.at(-1).hash;
+  }
   const MARK='risu-chronicle-memory-v1';
   function compatiblePrefix(source,tl) {
     const valid=validateState(source),next=emptyState();
@@ -466,6 +472,6 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,substituteNames,inputText,validateFilters,riskyPattern,applyFilters,FILTER_LIMIT,FILTER_PATTERN_LIMIT,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,validateFilters,riskyPattern,applyFilters,FILTER_LIMIT,FILTER_PATTERN_LIMIT,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,batchStillValid,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;

@@ -21,7 +21,7 @@ const ChronicleCore = (() => {
     embeddingProvider:'gemini', embeddingModel:'', embeddingEndpoint:'', embeddingProject:'', embeddingLocation:'us-central1',
     embeddingVertexMethod:'predict', embeddingReuseCredential:true, embeddingProfiles:{},
     recallTopK:3, recallCharBudget:2200, recallMinSimilarity:0.4, embeddingBatchesPerRequest:8,
-    summaryContext:'previous', hybridLogScope:'all', hybridRecentChunks:10, inputFilters:[] });
+    summaryContext:'previous', hybridLogScope:'all', hybridRecentChunks:10, inputFilters:[], summaryBlocking:'wait' });
   function settings(input = {}) {
     if(!input||typeof input!=='object'||Array.isArray(input))throw Error('설정은 객체 형식이어야 합니다.');
     const s = { ...DEFAULTS, ...input };
@@ -38,6 +38,7 @@ const ChronicleCore = (() => {
     if (!['rolling','chunk'].includes(s.rawTrim)) throw Error('원문 자르기는 매 턴 이동 또는 청크 커밋 시 이동을 선택하세요.');
     if(!['all','recent','none'].includes(s.risuLogScope))throw Error('잘못된 Risu 병행 연대기 주입 범위');
     if(!['all','recent'].includes(s.hybridLogScope))throw Error('잘못된 하이브리드 누적 로그 주입 범위');
+    if(!['wait','nonblocking'].includes(s.summaryBlocking))throw Error('요약 대기 방식은 기다림 또는 기다리지 않음을 선택하세요.');
     if(!['previous','none'].includes(s.summaryContext))throw Error('요약 시 직전 청크 참고는 사용 또는 사용 안 함을 선택하세요.');
     if(!['openai','gemini','vertex','external','voyage'].includes(s.embeddingProvider))throw Error('임베딩 제공자를 선택하세요.');
     if(!['predict','embedContent'].includes(s.embeddingVertexMethod))throw Error('Vertex 임베딩 호출 형식을 확인하세요.');
@@ -83,7 +84,7 @@ const ChronicleCore = (() => {
     }
     return out;
   }
-  const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',rawTrim:'chronicle_raw_trim',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks',hybridLogScope:'chronicle_hybrid_scope',hybridRecentChunks:'chronicle_hybrid_chunks'};
+  const CHAT_KEYS={enabled:'chronicle_enabled',interval:'chronicle_interval',recent:'chronicle_recent',rawTrim:'chronicle_raw_trim',charsPerTurn:'chronicle_chars',maxOutputTokens:'chronicle_tokens',batchesPerRequest:'chronicle_batches',mode:'chronicle_mode',cleanSummaryInput:'chronicle_clean',risuCharsPerTurn:'chronicle_risu_chars',risuLogScope:'chronicle_risu_scope',risuRecentChunks:'chronicle_risu_chunks',hybridLogScope:'chronicle_hybrid_scope',hybridRecentChunks:'chronicle_hybrid_chunks',summaryBlocking:'chronicle_blocking'};
   function chatSettings(s,chat) {
     let resolved=settings(s); const warnings=[];
     for(const [setting,key] of Object.entries(CHAT_KEYS)) {
@@ -94,7 +95,7 @@ const ChronicleCore = (() => {
         if(setting==='enabled'||setting==='cleanSummaryInput') {
           if(!['0','1','true','false'].includes(String(value))) throw Error('채팅 기억 활성 설정 오류');
           parsed=['1','true'].includes(String(value));
-        } else parsed=['mode','risuLogScope','rawTrim','hybridLogScope'].includes(setting)?String(value):Number(value);
+        } else parsed=['mode','risuLogScope','rawTrim','hybridLogScope','summaryBlocking'].includes(setting)?String(value):Number(value);
         resolved=settings({...resolved,[setting]:parsed});
       } catch {
         warnings.push(`${key}: 잘못된 채팅 설정 대신 플러그인 기본값 ${s[setting] ?? DEFAULTS[setting]} 사용`);
@@ -405,6 +406,11 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     delete next.lastRecall;next.revision++;next.summaryWarnings=text.warnings||[];
     return next;
   }
+  // Non-blocking commits may land after newer turns or a reroll AFTER the range; the chained
+  // hash of the batch's last turn still proves every summarized source turn is unchanged.
+  function batchStillValid(batch,tl){
+    return !!batch.length&&tl.turns[batch.at(-1).number-1]?.hash===batch.at(-1).hash;
+  }
   const MARK='risu-chronicle-memory-v1';
   function compatiblePrefix(source,tl) {
     const valid=validateState(source),next=emptyState();
@@ -475,7 +481,7 @@ ${s.customPrompt ? '\n추가 기록 지침 (언어·문체·분야별 우선순�
     return out;
   }
   return { DEFAULTS,settings,CHAT_KEYS,chatSettings,chars,digest,sourceText,createTimelineReader,timeline,emptyState,validateState,normalizeArchives,restoreState,escapeMarkers,reconcile,covered,nextBatch,
-    summaryInput,substituteNames,inputText,validateFilters,riskyPattern,applyFilters,FILTER_LIMIT,FILTER_PATTERN_LIMIT,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
+    summaryInput,substituteNames,inputText,validateFilters,riskyPattern,applyFilters,FILTER_LIMIT,FILTER_PATTERN_LIMIT,summaryPerTurn,summaryTarget,summaryPrompt,previousReference,calendarDate,parseSummary,stripDerivedState,hasDerivedState,commit,batchStillValid,resummarizable,replaceEntry,compatiblePrefix,injectedEntries,memoryText,entryText,rawStart,inject,MARK };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports=ChronicleCore;
 
@@ -1080,8 +1086,12 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
   if (!api) throw Error('RisuAI API 3.0이 필요합니다.');
   const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:', HEALTH=NS+'health';
   let serial=Promise.resolve(), lastStatus='준비됨', uiContext=null, uiState=null, failedUntil=new Map(), embeddingFailedUntil=new Map(),recoveringConfig=false;
-  let activeOperation=null,lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,pendingResummarize=null,working=0;
+  let lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,pendingResummarize=null,working=0;
   let hookLifecycle=null,startupTimer=null,unloaded=false;
+  // Every model call in flight (an RP-path or settings call, plus at most one background
+  // summary per chat in non-blocking mode). The stop button stops all of them.
+  const activeOperations=new Set(),background=new Map();
+  const activeOperation=()=>[...activeOperations].find(op=>!op.stopped)||[...activeOperations][0]||null;
   const detachedRequests=new Map(),timeline=C.createTimelineReader();
   const exclusive=fn=>{
     const task=serial.then(async()=>{working++;try{return await fn();}finally{working--;renderHealth();}}); serial=task.catch(()=>{}); return task;
@@ -1094,10 +1104,12 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
   const save=(key,value)=>api.pluginStorage.setItem(key,JSON.stringify(value));
   function waitError(code,message){const e=Error(message);e.code=code;return e;}
   function stopWaiting() {
-    const op=activeOperation;if(!op||op.stopped)return;
-    op.stopped=true;
-    if(op.started)detachedRequests.set(op.key,op);
-    op.stop(waitError('CHRONICLE_WAIT_STOPPED','기억 호출 기다리기를 중단했습니다. 저장한 청크와 미요약 원문은 유지합니다.'));
+    const running=[...activeOperations].filter(op=>!op.stopped);if(!running.length)return;
+    for(const op of running){
+      op.stopped=true;
+      if(op.started)detachedRequests.set(op.key,op);
+      op.stop(waitError('CHRONICLE_WAIT_STOPPED','기억 호출 기다리기를 중단했습니다. 저장한 청크와 미요약 원문은 유지합니다.'));
+    }
     renderHealth();
     notify('기다리기를 중단했습니다. 늦은 응답은 기록에 반영하지 않습니다. 서버 호출·과금의 취소는 보장하지 않으며, 이전 호출이 끝나기 전에는 이 채팅에서 새 기억 호출을 시작하지 않습니다.');
   }
@@ -1108,7 +1120,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     // Register a handler immediately, including a stop during the status write.
     stopped.catch(()=>{});
     const op={key:ctx.key,label,...range,stop,stopped:false,started:false};
-    activeOperation=op;renderHealth();
+    activeOperations.add(op);renderHealth();
     try {
       await health('running',label+' 응답 대기 중입니다. 자동 대기 제한은 없으며 설정창에서 기다리기만 중단할 수 있습니다.');
       if(op.stopped)await stopped;
@@ -1121,7 +1133,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       const settled=()=>{if(detachedRequests.get(ctx.key)===op)detachedRequests.delete(ctx.key);};
       job.then(settled,settled);
       const value=await Promise.race([job,stopped]);if(op.stopped)await stopped;return value;
-    }finally{if(activeOperation===op)activeOperation=null;renderHealth();}
+    }finally{activeOperations.delete(op);renderHealth();}
   }
   function renderHealth() {
     if(typeof document==='undefined')return;
@@ -1129,13 +1141,15 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     if(hookPanel&&hookState){hookPanel.textContent=ChronicleLifecycle.describe(hookState);hookPanel.dataset.warning=hookState.phase==='confirmed'?'false':'true';}
     if(hookButton&&hookState){hookButton.disabled=['pending','unloaded'].includes(hookState.phase);hookButton.textContent=hookState.phase==='confirmed'?'주입 훅 연결 확인됨':'주입 권한 확인·등록';}
     const button=document.getElementById('stopWait');
-    if(button){button.hidden=!activeOperation;button.disabled=!activeOperation||activeOperation.stopped;}
+    const op=activeOperation();
+    if(button){button.hidden=!op;button.disabled=!op||op.stopped;}
     const panel=document.getElementById('health');if(!panel)return;
     const env=E.memoryError(),h=lastHealth;
     const label={running:'요약 처리 중',ok:'기억 처리 정상',warning:'주의 · 기억 처리 일부 실패',skipped:'기억 처리 건너뜀'}[h?.status]||'아직 처리 기록 없음';
-    const pending=h?.status==='running'&&!activeOperation&&!working?'이전 기억 호출의 완료 여부를 확인하지 못했습니다. 저장된 기록까지 유지하며 다음 RP 요청 또는 미처리 구간 요약에서 남은 구간을 확인합니다. 다른 탭에서 처리 중이라면 완료 후 확인하세요.':h?.message||'';
-    panel.textContent=[env||label,h?.at?`마지막 기록: ${new Date(h.at).toLocaleString()}`:'',pending].filter(Boolean).join('\n');
-    panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!activeOperation&&!working)?'true':'false';
+    const jobs=[...background.values()].map(job=>`백그라운드 요약 진행 중: T${job.from}~T${job.to} · ${new Date(job.startedAt).toLocaleTimeString()} 시작. RP 요청은 기다리지 않고 미요약 원문을 그대로 보냅니다. 끝나지 않으면 기다리기 중단을 누르세요.`).join('\n');
+    const pending=h?.status==='running'&&!op&&!working?'이전 기억 호출의 완료 여부를 확인하지 못했습니다. 저장된 기록까지 유지하며 다음 RP 요청 또는 미처리 구간 요약에서 남은 구간을 확인합니다. 다른 탭에서 처리 중이라면 완료 후 확인하세요.':h?.message||'';
+    panel.textContent=[env||label,h?.at?`마지막 기록: ${new Date(h.at).toLocaleString()}`:'',pending,jobs].filter(Boolean).join('\n');
+    panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!op&&!working)?'true':'false';
   }
   async function health(status,message) {
     if(unloaded)return;
@@ -1268,6 +1282,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       if(!batch.length) break;
       const failureKey=ctx.key+':'+batch.at(-1).hash;
       if(!force && (failedUntil.get(failureKey)||0)>Date.now()) break;
+      if(background.has(ctx.key)) break; // A background summary owns this chat's next batch.
       try {
         const result=await waitForModel(ctx,`T${batch[0].number}~T${batch.at(-1).number} 요약`,transport=>summarize(batch,s,{...ctx,previous:current.entries.at(-1)},transport),{from:batch[0].number,to:batch.at(-1).number});
         await unchanged(ctx);
@@ -1284,6 +1299,53 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       }
     }
     return current;
+  }
+  // Non-blocking mode: start the summary and return at once. Only the model call runs outside
+  // the memory queue; each commit re-enters it, so state writes stay serialized. There is no
+  // automatic timeout or discard: an unfinished job keeps this chat's later batches waiting
+  // (raw kept) until it settles or the user presses the stop button.
+  function startBackground(ctx,state,s){
+    if(background.has(ctx.key))return 'running';
+    if(detachedRequests.has(ctx.key))return 'pending';
+    const batch=C.nextBatch(state,ctx.tl,s);if(!batch.length)return '';
+    if((failedUntil.get(ctx.key+':'+batch.at(-1).hash)||0)>Date.now())return 'retry-wait';
+    const job={key:ctx.key,from:batch[0].number,to:batch.at(-1).number,startedAt:Date.now()};
+    background.set(ctx.key,job);
+    job.done=runBackground(ctx,state,s,job).catch(()=>{}).finally(()=>{if(background.get(ctx.key)===job)background.delete(ctx.key);renderHealth();});
+    renderHealth();return 'started';
+  }
+  async function runBackground(ctx,state,s,job){
+    let current=state,tl=ctx.tl;
+    for(let n=0;n<s.batchesPerRequest;n++){
+      const batch=C.nextBatch(current,tl,s);if(!batch.length)break;
+      const failureKey=ctx.key+':'+batch.at(-1).hash,range=`T${batch[0].number}~T${batch.at(-1).number}`;
+      job.from=batch[0].number;job.to=batch.at(-1).number;renderHealth();
+      try{
+        const previous=current.entries.at(-1);
+        const result=await waitForModel(ctx,`${range} 백그라운드 요약`,transport=>summarize(batch,s,{...ctx,previous},transport),{from:job.from,to:job.to});
+        ({state:current,tl}=await exclusive(async()=>{
+          if(unloaded)throw waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 기록을 저장하지 않습니다.');
+          const now=await conversation();
+          if(now.key!==ctx.key){const e=Error('요약하는 동안 대화가 바뀌어 결과를 저장하지 않았습니다. 돌아오면 다시 요약합니다.');e.code='CHRONICLE_CONTEXT_CHANGED';throw e;}
+          const fresh={...now,tl:await timeline(now.chat.message)};
+          if(!C.batchStillValid(batch,fresh.tl)){const e=Error(`${range} 원문이 요약 도중 수정·재생성되어 결과를 저장하지 않았습니다.`);e.code='CHRONICLE_CONTEXT_CHANGED';throw e;}
+          const latest=C.reconcile(await stateFor(fresh),fresh.tl);
+          if(C.covered(latest)!==batch[0].number-1)throw Error(`${range} 구간이 그사이 다른 경로로 기록되거나 변경되어 결과를 저장하지 않았습니다.`);
+          const next=C.commit(latest,batch,result.text);next.lastSummaryInput=result.stats;
+          await persistState(fresh,next);failedUntil.delete(failureKey);
+          lastStatus=`${range} 백그라운드 기록 완료 · 다음 RP 요청부터 반영합니다.`;await health('ok',lastStatus);
+          return {state:next,tl:fresh.tl};
+        }));
+      }catch(e){
+        failedUntil.set(failureKey,Date.now()+60000);lastStatus=redact(e);
+        await health(e.code==='CHRONICLE_WAIT_STOPPED'||e.code==='CHRONICLE_WAIT_PENDING'?'skipped':'warning','백그라운드 요약을 저장하지 않았습니다. 저장된 기억과 미처리 원문을 유지합니다. '+P.safeError(e));
+        if(e.code!=='CHRONICLE_CONTEXT_CHANGED'&&e.code!=='CHRONICLE_WAIT_STOPPED')await exclusive(async()=>{
+          try{const now=await conversation();if(now.key!==ctx.key||unloaded)return;const fresh={...now,tl:await timeline(now.chat.message)};
+            const latest=await stateFor(fresh);latest.lastError=redact(e);await persistState(fresh,latest);}catch{/* Diagnostics only. */}
+        });
+        break; // The failed chunk and every later chunk stay verbatim.
+      }
+    }
   }
   async function recall(ctx,state,s,force=false){
     const warnings=[],query=R.query(ctx.tl,text=>C.inputText(text,s,ctx)),savedIndex=await D.vectors(ctx.key);
@@ -1354,6 +1416,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
   async function resummarize(target) {
     const ctx=await context();
     if(ctx.key!==target.key)throw Error('대화가 바뀌었습니다. 다시 요약하지 않았습니다. 현재 대화를 다시 불러오세요.');
+    if(background.has(ctx.key))throw Error('이 대화의 백그라운드 요약이 진행 중입니다. 끝난 뒤 다시 시도하거나 기다리기 중단을 누르세요.');
     const cfg=C.chatSettings(await config(),ctx.chat),state=C.reconcile(await stateFor(ctx),ctx.tl);
     if(!cfg.enabled)throw Error('이 대화에서는 기억 사용이 꺼져 있어 다시 요약하지 않았습니다.');
     if(state.revision!==target.revision)throw Error('기억이 변경되었습니다. 현재 대화를 다시 불러온 뒤 다시 시도하세요.');
@@ -1383,7 +1446,12 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
         const global=await config(),base=await conversation(),s=C.chatSettings(global,base.chat);
         if(!s.enabled)return messages;
         E.assertMemory();const ctx={...base,tl:await timeline(base.chat.message)};
-        const initial=await stateFor(ctx),state=await generate(ctx,initial,s);
+        const initial=await stateFor(ctx);let state,started='';
+        if(s.summaryBlocking==='nonblocking'){
+          // Send now with the saved log plus unsummarized raw; the new chunk applies next request.
+          state=C.reconcile(initial,ctx.tl);if(state.revision!==initial.revision)await persistState(ctx,state);
+          started=startBackground(ctx,state,s);
+        }else state=await generate(ctx,initial,s);
         let result={text:'',warnings:[]};
         if(s.mode==='hybrid'&&state.entries.length){await unchanged(ctx);result=await recall(ctx,state,s);}
         await unchanged(ctx);
@@ -1391,7 +1459,9 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
         const out=C.inject(messages,state,ctx.tl,s,text=>warnings.push(text),result.text),warning=warnings.join('\n');
         if((state.lastWarning||'')!==warning){state.lastWarning=warning;await persistState(ctx,state);}
         if(warning)lastStatus=warning;
-        await health(state.lastError||warning?'warning':'ok',state.lastError?'요약 실패 구간은 처리하지 않은 원문으로 유지합니다. '+P.safeError(state.lastError):warning||'설정에 따라 기억 처리를 완료했습니다.');
+        const backgroundNote=started==='started'||started==='running'?`T${background.get(ctx.key)?.from}~T${background.get(ctx.key)?.to} 요약을 백그라운드에서 진행 중입니다. 이번 요청은 미요약 원문을 그대로 보냈습니다.`:'';
+        if(backgroundNote&&!state.lastError&&!warning)lastStatus=backgroundNote;
+        await health(state.lastError||warning?'warning':'ok',state.lastError?'요약 실패 구간은 처리하지 않은 원문으로 유지합니다. '+P.safeError(state.lastError):warning||backgroundNote||'설정에 따라 기억 처리를 완료했습니다.');
         return out;
       }catch(e){
         if(e.code==='CHRONICLE_CONTEXT_CHANGED'){await health('warning','대화·원문이 바뀌어 오래된 결과를 사용하지 않았습니다. 다시 요청하세요.');throw e;}
@@ -1429,7 +1499,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       hybridLogScope:$('hybridLogScope').value,hybridRecentChunks:Number($('hybridRecentChunks').value),
       provider:$('provider').value,mode:$('mode').value,endpoint:$('endpoint').value.trim(),model:$('model').value.trim(),
       tokenField:$('tokenField').value,
-      batchesPerRequest:Number($('batchesPerRequest').value),customPrompt:$('customPrompt').value,summaryContext:$('summaryContext').value,
+      batchesPerRequest:Number($('batchesPerRequest').value),summaryBlocking:$('summaryBlocking').value,customPrompt:$('customPrompt').value,summaryContext:$('summaryContext').value,
       project:$('project').value.trim(),location:$('location').value.trim(),publisher:$('publisher').value,
       anthropicVersion:$('anthropicVersion').value.trim(),allowPlugins:$('allowPlugins').checked,profiles:draftProfiles,autoRestoreCache:$('autoRestoreCache').checked,
       cleanSummaryInput:$('cleanSummaryInput').checked,inputFilters:readFilters(),
@@ -1592,9 +1662,9 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       controls.forEach(b=>{if(!['close','stopWait','ensureHook','cancelDelete','cancelPromptDelete','cancelResummarize'].includes(b.id))b.disabled=true;});
       try{
         await exclusive(fn);
-        if(lastHealth?.status==='running'&&!activeOperation)await health('ok','설정창의 기억 호출 작업을 완료했습니다.');
+        if(lastHealth?.status==='running'&&!activeOperation())await health('ok','설정창의 기억 호출 작업을 완료했습니다.');
       }catch(e){
-        if(lastHealth?.status==='running'&&!activeOperation)await health(e.code==='CHRONICLE_WAIT_STOPPED'||e.code==='CHRONICLE_WAIT_PENDING'?'skipped':'warning',P.safeError(e));
+        if(lastHealth?.status==='running'&&!activeOperation())await health(e.code==='CHRONICLE_WAIT_STOPPED'||e.code==='CHRONICLE_WAIT_PENDING'?'skipped':'warning',P.safeError(e));
         notify(e.message);
       }
       finally{controls.forEach((b,i)=>b.disabled=previous[i]);uiBusy=false;renderHealth();}
@@ -1634,8 +1704,8 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     if($('effectiveSettings')) {
       const operation=cfg.mode==='risu'?`Risu 기억 병행 · 원문: Risu 관리 (최근 원문 수·자르기 방식 미적용) · 자체 자동 검색 꺼짐 · 연대기 ${cfg.risuLogScope==='all'?'전체':cfg.risuLogScope==='recent'?`최근 ${cfg.risuRecentChunks}청크`:'기록만'}`:`${cfg.mode==='hybrid'?`자체 하이브리드 · 누적 로그 ${cfg.hybridLogScope==='recent'?`최근 ${cfg.hybridRecentChunks}청크 (오래된 청크는 검색으로만)`:'전체'}`:'단독'} · 원문 기본 ${cfg.recent}턴 · ${cfg.rawTrim==='chunk'?'청크 커밋 시 이동 (계단식)':'매 턴 이동'} · 정책상 완료 원문 ${ctx.tl.turns.length-C.rawStart(state,ctx.tl,cfg)}턴 유지 (미처리 포함)`;
       const overrides=Object.entries(C.CHAT_KEYS).filter(([key])=>cfg[key]!==globalSettings[key]).map(([key])=>key);
-      $('effectiveSettings').textContent=(overrides.length?`채팅 변수 적용: ${overrides.map(key=>({enabled:'기억 사용',interval:'요약 주기',recent:'최근 원문',rawTrim:'원문 자르기 방식',charsPerTurn:'요약 목표',maxOutputTokens:'응답 상한',batchesPerRequest:'요청당 묶음',mode:'처리 방식',cleanSummaryInput:'입력 정리',risuCharsPerTurn:'병행 요약 목표',risuLogScope:'병행 주입 범위',risuRecentChunks:'병행 청크 수',hybridLogScope:'하이브리드 주입 범위',hybridRecentChunks:'하이브리드 청크 수'})[key]||key).join(', ')} · 카드/모듈에서 지정할 수 있습니다.\n`:'플러그인 기본값과 같은 동작입니다.\n')+`현재 대화 적용값: ${cfg.enabled?'사용':'중지'} · ${cfg.interval}턴마다 · ${operation}`+
-        ` · 청크 본문 권장 목표 ${C.summaryTarget(cfg,cfg.interval)}글자 (초과해도 수용) · 응답 ${cfg.maxOutputTokens}토큰 상한/목표 · 입력 정리 ${cfg.cleanSummaryInput?'사용':'해제'}`;
+      $('effectiveSettings').textContent=(overrides.length?`채팅 변수 적용: ${overrides.map(key=>({enabled:'기억 사용',interval:'요약 주기',recent:'최근 원문',rawTrim:'원문 자르기 방식',charsPerTurn:'요약 목표',maxOutputTokens:'응답 상한',batchesPerRequest:'요청당 묶음',mode:'처리 방식',cleanSummaryInput:'입력 정리',risuCharsPerTurn:'병행 요약 목표',risuLogScope:'병행 주입 범위',risuRecentChunks:'병행 청크 수',hybridLogScope:'하이브리드 주입 범위',hybridRecentChunks:'하이브리드 청크 수',summaryBlocking:'요약 대기 방식'})[key]||key).join(', ')} · 카드/모듈에서 지정할 수 있습니다.\n`:'플러그인 기본값과 같은 동작입니다.\n')+`현재 대화 적용값: ${cfg.enabled?'사용':'중지'} · ${cfg.interval}턴마다 · ${operation}`+
+        ` · 청크 본문 권장 목표 ${C.summaryTarget(cfg,cfg.interval)}글자 (초과해도 수용) · 응답 ${cfg.maxOutputTokens}토큰 상한/목표 · 입력 정리 ${cfg.cleanSummaryInput?'사용':'해제'} · 요약 ${cfg.summaryBlocking==='nonblocking'?'기다리지 않음 (반영 한 턴 늦음)':'기다림'}`;
       $('diagnostics').textContent=[...new Set([cfg.configWarning||'',...cfg.settingWarnings,...(state.summaryWarnings||[]),state.lastWarning||''])].filter(Boolean).join('\n') || '설정·원문 확인 경고 없음';
     }
     const recallInfo=await D.recall(ctx.key);
@@ -1802,7 +1872,9 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
       <label>구간 응답 토큰 상한/목표<input id="maxOutputTokens" type="number" min="128" max="8192"></label>
       <label>원문 처리<select id="mode"><option value="standalone">단독 · 누적 로그 + 최근 원문</option><option value="hybrid">자체 하이브리드 · 단독 + 청크 검색</option><option value="risu">Risu 기억 병행 · 하이파 주력</option></select></label>
       <label>요청당 최대 요약 묶음<input id="batchesPerRequest" type="number" min="1" max="20"></label>
+      <label>요약 대기 방식<select id="summaryBlocking"><option value="wait">기다림 · 요약 후 RP 전송 (기본)</option><option value="nonblocking">기다리지 않음 · 요약은 뒤에서 진행</option></select></label>
       </div>
+      <p><strong>요약 대기 방식 · 기다리지 않음</strong>은 기본 꺼짐입니다. 켜면 요약이 필요한 턴에도 RP 요청을 바로 보내고 요약은 뒤에서 진행합니다. 대신 <strong>새 청크 반영이 한 턴 늦어지고, 그 턴은 미요약 원문이 그대로 들어가 입력이 늘어납니다.</strong> 요약이 끝나면 요약한 구간의 원문이 그대로인지 확인한 뒤 저장하며, 그 구간이 수정·재생성되었거나 대화가 바뀌었으면 저장하지 않고 나중에 다시 요약합니다. 자동 시간제한은 없습니다. 휴대폰 화면을 끄는 등으로 요약이 끝나지 않으면 같은 대화의 다음 요약은 시작하지 않고 원문을 유지하므로, 설정창의 ‘기다리기 중단’을 누르세요. RP 요청과 요약 요청이 동시에 나가므로 제공자의 동시 요청 한도에 걸릴 수 있습니다.</p>
       <p id="rawTrimHelp">매 턴 이동은 최근 N턴을 매번 유지합니다. 계단식은 마지막 요약 완료 지점에서 N턴을 남기고 새 원문을 덧붙이다가 다음 청크 저장 시 한 번에 자릅니다. 주기 5·최근 원문 5라면 정상 진행 중 5~9턴(평균 약 7턴)이 남습니다. 실패·중단·따라잡기 중에는 더 남습니다. 평균 입력이 늘지만 원문 앞부분이 유지돼 캐시 활용에 유리할 수 있습니다. 실제 적중·비용 절감은 제공자와 Risu의 프롬프트·캐시 설정에 따라 달라집니다. 설정 변경·원문 수정·백업 복원 시에는 범위를 다시 계산합니다.</p><div id="hybridSettings" hidden><h3>자체 하이브리드 전용 · 누적 로그 주입 범위</h3><div class="grid">
       <label>하이브리드 누적 로그 주입<select id="hybridLogScope"><option value="all">누적 로그 전체 (기본)</option><option value="recent">최근 K청크 + 오래된 청크는 검색으로만</option></select></label>
       <label id="hybridChunkCount">최근 청크 수 K (1~100)<input id="hybridRecentChunks" type="number" min="1" max="100"></label></div>
@@ -1994,6 +2066,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
     });
     action('generate',async()=>{
       await saveSettings();const ctx=await context();const cfg=C.chatSettings(await config(true),ctx.chat);
+      if(background.has(ctx.key))throw Error('이 대화의 백그라운드 요약이 진행 중입니다. 끝난 뒤 다시 시도하거나 기다리기 중단을 누르세요.');
       notify('미처리 구간을 요약하고 있습니다…');
       const state=C.reconcile(await stateFor(ctx),ctx.tl);
       if(!C.nextBatch(state,ctx.tl,cfg).length) {
@@ -2050,7 +2123,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
   const onVisibility=()=>{
     if(document.visibilityState!=='hidden'){
       renderHealth();
-      if(activeOperation&&document.getElementById('status'))notify(`${activeOperation.label} 응답을 기다리고 있습니다. 기다리기 중단을 선택할 수 있으며 자동으로 중복 재시도하지 않습니다.`);
+      if(activeOperation()&&document.getElementById('status'))notify(`${activeOperation().label} 응답을 기다리고 있습니다. 기다리기 중단을 선택할 수 있으며 자동으로 중복 재시도하지 않습니다.`);
     }
   };
   if(typeof document!=='undefined'&&typeof document.addEventListener==='function'){
@@ -2060,7 +2133,7 @@ if(typeof module!=='undefined')module.exports=ChronicleLifecycle;
   if(typeof api.onUnload==='function')await api.onUnload(async()=>{
     unloaded=true;
     if(startupTimer!==null){clearTimeout(startupTimer);startupTimer=null;}
-    if(activeOperation){activeOperation.stopped=true;activeOperation.stop(waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 호출 결과를 반영하지 않습니다.'));}
+    for(const op of activeOperations){op.stopped=true;op.stop(waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 호출 결과를 반영하지 않습니다.'));}
     if(typeof document!=='undefined'&&typeof document.removeEventListener==='function'){
       document.removeEventListener('click',onClick);document.removeEventListener('visibilitychange',onVisibility);
     }

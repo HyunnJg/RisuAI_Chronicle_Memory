@@ -12,11 +12,12 @@ const ChronicleRetrieval=(()=>{
     const result=dot/(Math.sqrt(aa)*Math.sqrt(bb));return Number.isFinite(result)?Math.max(-1,Math.min(1,result)):null;
   }
   const document=e=>[e.title||'',e.text,(e.keywords||[]).join(' · ')].filter(Boolean).join('\n');
-  function query(tl){
+  // transform: summary-input preprocessing shared with the summarizer (names, filters).
+  function query(tl,transform=text=>text){
     const messages=tl.turns.slice(-2).flatMap(t=>t.messages).concat(tl.pending);
     return Array.from(messages.map(m=>{
-      const text=m.data.replace(/<([a-z_][\w:.-]*)\b[^>]*>\s*[\[{][\s\S]*?<\/\1\s*>/gi,'')
-        .replace(/<[^>]+>/g,' ');
+      const text=transform(m.data.replace(/<([a-z_][\w:.-]*)\b[^>]*>\s*[\[{][\s\S]*?<\/\1\s*>/gi,'')
+        .replace(/<[^>]+>/g,' '));
       const limit=tl.pending.includes(m)?2400:1200;
       return `${m.role==='user'?'사용자':'최근 상황'}: ${Array.from(text).slice(-limit).join('')}`;
     }).join('\n')).slice(-6000).join('').trim();

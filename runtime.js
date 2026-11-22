@@ -212,7 +212,7 @@
     return current;
   }
   async function recall(ctx,state,s,force=false){
-    const warnings=[],query=R.query(ctx.tl),savedIndex=await D.vectors(ctx.key);
+    const warnings=[],query=R.query(ctx.tl,text=>C.inputText(text,s,ctx)),savedIndex=await D.vectors(ctx.key);
     const index={schema:1,entries:Object.assign(Object.create(null),savedIndex.entries)};
     const signature=await C.digest([s.embeddingProvider,s.embeddingModel,s.embeddingEndpoint,s.embeddingProject,s.embeddingLocation,s.embeddingVertexMethod,P.isVoyageEmbedding(s)?'chronicle-voyage-embedding-v1':'chronicle-embedding-v1']);
     let dirty=false,vector=null,embeddingReady=false,keywordReason='';

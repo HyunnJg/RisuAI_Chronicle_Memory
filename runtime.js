@@ -8,7 +8,7 @@
   const NS='risu-chronicle:v1:', SETTINGS=NS+'settings', KEY=NS+'external-key', CHAT_PREFIX=NS+'chat:', BLOCK_PREFIX=NS+'cache-block:', HEALTH=NS+'health';
   let serial=Promise.resolve(), lastStatus='준비됨', uiContext=null, uiState=null, failedUntil=new Map(), embeddingFailedUntil=new Map(),recoveringConfig=false;
   let lastHealth=null,preparedBackup=null,uiBusy=false,opening=null,pendingDelete=null,pendingResummarize=null,working=0;
-  let hookLifecycle=null,startupTimer=null,unloaded=false,selectedPage='basic';
+  let hookLifecycle=null,startupTimer=null,unloaded=false,selectedPage='basic',uiVisible=false,waitTimer=null;
   // Every model call in flight (an RP-path or settings call, plus at most one background
   // summary per chat in non-blocking mode). The stop button stops all of them.
   const activeOperations=new Set(),background=new Map();
@@ -43,7 +43,7 @@
     let stop;const stopped=new Promise((_,reject)=>stop=reject);
     // Register a handler immediately, including a stop during the status write.
     stopped.catch(()=>{});
-    const op={key:ctx.key,label,...range,stop,stopped:false,started:false};
+    const op={key:ctx.key,label,...range,startedAt:Date.now(),stop,stopped:false,started:false};
     activeOperations.add(op);renderHealth();
     try {
       await health('running',label+' 응답 대기 중입니다. 자동 대기 제한은 없으며 설정창에서 기다리기만 중단할 수 있습니다.');
@@ -56,7 +56,7 @@
       const job=Promise.resolve().then(()=>{if(op.stopped)return stopped;op.started=true;return fn(guarded);});
       const settled=()=>{
         const pending=detachedRequests.get(ctx.key);if(!pending)return;
-        pending.delete(op);if(!pending.size)detachedRequests.delete(ctx.key);
+        pending.delete(op);if(!pending.size)detachedRequests.delete(ctx.key);renderHealth();
       };
       job.then(settled,settled);
       const value=await Promise.race([job,stopped]);if(op.stopped)await stopped;return value;
@@ -73,11 +73,19 @@
     const panel=document.getElementById('health');if(!panel)return;
     const env=E.memoryError(),h=lastHealth;
     const label={running:'요약 처리 중',ok:'기억 처리 정상',warning:'주의 · 기억 처리 일부 실패',skipped:'기억 처리 건너뜀'}[h?.status]||'아직 처리 기록 없음';
-    const jobs=[...background.values()].map(job=>`백그라운드 요약 진행 중: T${job.from}~T${job.to} · ${new Date(job.startedAt).toLocaleTimeString()} 시작. RP 요청은 기다리지 않고 미요약 원문을 그대로 보냅니다. 끝나지 않으면 기다리기 중단을 누르세요.`).join('\n');
-    const pending=h?.status==='running'&&!op&&!working?'이전 기억 호출의 완료 여부를 확인하지 못했습니다. 저장된 기록까지 유지하며 다음 RP 요청 또는 미처리 구간 요약에서 남은 구간을 확인합니다. 다른 탭에서 처리 중이라면 완료 후 확인하세요.':h?.message||'';
-    panel.textContent=[env||label,h?.at?`마지막 기록: ${new Date(h.at).toLocaleString()}`:'',pending,jobs].filter(Boolean).join('\n');
-    panel.dataset.warning=env||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!op&&!working)?'true':'false';
+    const calls=[...activeOperations].filter(op=>!op.stopped),detached=[...detachedRequests.values()].flatMap(set=>[...set]);
+    const elapsed=op=>{const seconds=Math.max(0,Math.floor((Date.now()-op.startedAt)/1000));return seconds<60?`${seconds}초`:`${Math.floor(seconds/60)}분 ${seconds%60}초`;};
+    const longWait=calls.some(op=>Date.now()-op.startedAt>=180000);
+    const jobs=calls.map(op=>`${op.label} · ${elapsed(op)} 경과`).concat(detached.map(op=>`${op.label} · 기다리기 중단 · ${elapsed(op)} 경과. 이전 호출이 끝날 때까지 새 기억 호출을 보류합니다.`));
+    for(const job of background.values())jobs.push(`미처리 원문 ${job.unprocessed}턴 유지 · 요약 완료 후 다음 요청부터 반영`);
+    if(longWait)jobs.push('응답이 오래 지연되고 있습니다. 미요약 원문을 유지하므로 입력 분량이 늘어날 수 있습니다.');
+    const pending=h?.status==='running'&&!op&&!working&&!detached.length?'이전 기억 호출의 완료 여부를 확인하지 못했습니다. 다음 요청에서 남은 구간을 확인합니다.':h?.message||'';
+    panel.textContent=[env||label,h?.at?`마지막 기록: ${new Date(h.at).toLocaleString()}`:'',pending,...jobs].filter(Boolean).join('\n');
+    panel.dataset.warning=env||longWait||detached.length||h?.status==='skipped'||h?.status==='warning'||(h?.status==='running'&&!op&&!working)?'true':'false';
+    if(waitTimer!==null){clearTimeout(waitTimer);waitTimer=null;}
+    if(uiVisible&&!unloaded&&document.visibilityState!=='hidden'&&(calls.length||detached.length))waitTimer=setTimeout(()=>{waitTimer=null;renderHealth();},15000);
   }
+
   async function health(status,message) {
     if(unloaded)return;
     lastHealth={status,message:redact(message),at:new Date().toISOString()};renderHealth();
@@ -127,7 +135,7 @@
   async function conversation() {
     const characterIndex=await api.getCurrentCharacterIndex();
     const char=await api.getCharacter();
-    if (!char || char.type==='group') throw Error('첫 버전은 1:1 캐릭터 대화만 지원합니다.');
+    if (!char || char.type==='group') throw waitError('CHRONICLE_UNSUPPORTED_CHAT','현재 대화에는 기억 처리를 적용하지 않습니다.');
     const chatIndex=char.chatPage, chat=char.chats?.[chatIndex];
     if (!char.chaId || !chat?.id || !Array.isArray(chat.message)) throw Error('캐릭터/대화의 고유 ID를 확인할 수 없습니다. 대화를 저장하고 다시 시도하세요.');
     if(characterIndex!==await api.getCurrentCharacterIndex() || chatIndex!==await api.getCurrentChatIndex()) throw Error('대화가 전환되었습니다. 다시 시도하세요.');
@@ -248,11 +256,11 @@
   // automatic timeout or discard: an unfinished job keeps this chat's later batches waiting
   // (raw kept) until it settles or the user presses the stop button.
   function startBackground(ctx,state,s){
-    if(background.has(ctx.key))return 'running';
+    if(background.has(ctx.key)){background.get(ctx.key).unprocessed=ctx.tl.turns.length-C.covered(state);renderHealth();return 'running';}
     if(detachedRequests.has(ctx.key))return 'pending';
     const batch=C.nextBatch(state,ctx.tl,s);if(!batch.length)return '';
     if((failedUntil.get(ctx.key+':'+batch.at(-1).hash)||0)>Date.now())return 'retry-wait';
-    const job={key:ctx.key,from:batch[0].number,to:batch.at(-1).number,startedAt:Date.now()};
+    const job={key:ctx.key,from:batch[0].number,to:batch.at(-1).number,startedAt:Date.now(),unprocessed:ctx.tl.turns.length-C.covered(state)};
     background.set(ctx.key,job);
     job.done=runBackground(ctx,state,s,job).catch(()=>{}).finally(()=>{if(background.get(ctx.key)===job)background.delete(ctx.key);renderHealth();});
     renderHealth();return 'started';
@@ -262,7 +270,7 @@
     for(let n=0;n<s.batchesPerRequest;n++){
       const batch=C.nextBatch(current,tl,s);if(!batch.length)break;
       const failureKey=ctx.key+':'+batch.at(-1).hash,range=`T${batch[0].number}~T${batch.at(-1).number}`;
-      job.from=batch[0].number;job.to=batch.at(-1).number;renderHealth();
+      job.from=batch[0].number;job.to=batch.at(-1).number;job.unprocessed=tl.turns.length-C.covered(current);renderHealth();
       try{
         const previous=current.entries.at(-1);
         const result=await waitForModel(ctx,`${range} 백그라운드 요약`,transport=>summarize(batch,s,{...ctx,previous},transport),{from:job.from,to:job.to});
@@ -410,7 +418,7 @@
         if(e.code==='CHRONICLE_CONTEXT_CHANGED'){await health('warning','대화·원문이 바뀌어 오래된 결과를 사용하지 않았습니다. 다시 요청하세요.');throw e;}
         lastStatus='기억 처리를 건너뛰고 원래 RP 요청을 유지했습니다: '+P.safeError(e);
         // Unsupported groups continue without a warning write, as before.
-        if(!String(e.message).includes('1:1 캐릭터'))await health('skipped',lastStatus);
+        if(e.code!=='CHRONICLE_UNSUPPORTED_CHAT')await health('skipped',lastStatus);
         return messages;
       }
     });
@@ -654,10 +662,9 @@
       (stats?` 최근 요약 T${stats.from}~T${stats.to}: 입력 JSON ${stats.originalChars} → ${stats.sentChars}글자 · ${stats.seconds}초.`+
         (Number.isFinite(stats.summaryChars)?` 저장 본문 ${stats.summaryChars}글자 / 권장 목표 ${stats.summaryTargetChars}글자.`:''):'');
     if($('effectiveSettings')) {
-      const operation=cfg.mode==='risu'?`Risu 기억 병행 · 원문: Risu 관리 (최근 원문 수·자르기 방식 미적용) · 자체 자동 검색 꺼짐 · 연대기 ${cfg.risuLogScope==='all'?'전체':cfg.risuLogScope==='recent'?`최근 ${cfg.risuRecentChunks}청크`:'기록만'}`:`${cfg.mode==='hybrid'?`자체 하이브리드 · 누적 로그 ${cfg.hybridLogScope==='recent'?`최근 ${cfg.hybridRecentChunks}청크 (오래된 청크는 검색으로만)`:'전체'}`:'단독'} · 원문 기본 ${cfg.recent}턴 · ${cfg.rawTrim==='chunk'?'청크 커밋 시 이동 (계단식)':'매 턴 이동'} · 정책상 완료 원문 ${ctx.tl.turns.length-C.rawStart(state,ctx.tl,cfg)}턴 유지 (미처리 포함)`;
-      const overrides=Object.entries(C.CHAT_KEYS).filter(([key])=>cfg[key]!==globalSettings[key]).map(([key])=>key);
-      $('effectiveSettings').textContent=(overrides.length?`채팅 변수 적용: ${overrides.map(key=>({enabled:'기억 사용',interval:'요약 주기',recent:'최근 원문',rawTrim:'원문 자르기 방식',charsPerTurn:'요약 목표',maxOutputTokens:'응답 상한',batchesPerRequest:'요청당 묶음',mode:'처리 방식',cleanSummaryInput:'입력 정리',risuCharsPerTurn:'병행 요약 목표',risuLogScope:'병행 주입 범위',risuRecentChunks:'병행 청크 수',hybridLogScope:'하이브리드 주입 범위',hybridRecentChunks:'하이브리드 청크 수',summaryBlocking:'요약 대기 방식'})[key]||key).join(', ')} · 카드/모듈에서 지정할 수 있습니다.\n`:'플러그인 기본값과 같은 동작입니다.\n')+`현재 대화 적용값: ${cfg.enabled?'사용':'중지'} · ${cfg.interval}턴마다 · ${operation}`+
-        ` · 청크 본문 권장 목표 ${C.summaryTarget(cfg,cfg.interval)}글자 (초과해도 수용) · 응답 ${cfg.maxOutputTokens}토큰 상한/목표 · 입력 정리 ${cfg.cleanSummaryInput?'사용':'해제'} · 요약 ${cfg.summaryBlocking==='nonblocking'?'기다리지 않음 (반영 한 턴 늦음)':'기다림'}`;
+      const mode={standalone:'단독',hybrid:'자체 하이브리드',risu:'Risu 기억 병행'}[cfg.mode];
+      const overrides=Object.keys(C.CHAT_KEYS).some(key=>cfg[key]!==globalSettings[key]);
+      $('effectiveSettings').textContent=`현재 대화 적용값: ${cfg.enabled?'사용':'중지'} · ${mode} · ${cfg.interval}턴마다 요약 · ${cfg.summaryBlocking==='nonblocking'?'기다리지 않음':'요약 후 전송'}${overrides?' · 모듈·채팅 설정 적용':''}`;
       $('diagnostics').textContent=[...new Set([cfg.configWarning||'',...cfg.settingWarnings,...(state.summaryWarnings||[]),state.lastWarning||''])].filter(Boolean).join('\n') || '설정·원문 확인 경고 없음';
     }
     const recallInfo=await D.recall(ctx.key);
@@ -672,15 +679,19 @@
       'not-configured':'키워드 검색: 임베딩 모델 미설정','indexing':'키워드 검색: 대상 청크 임베딩 색인 대기'
     }[recallInfo.reason]||searchLabel);
     $('recallState').textContent=(cfg.mode==='risu'?'Risu 기억 병행: 자체 자동 검색은 실행하지 않습니다. ':'')+(recallInfo?`임베딩 색인 ${recallInfo.indexed}/${recallInfo.total}개${recallInfo.total>0&&recallInfo.indexed===recallInfo.total?' 완료':''} · 마지막 실행: ${searchLabel} · 재강조 ${recallInfo.selected.length}개. 자체 하이브리드에서만 이 재강조 기록을 보냅니다.`:'아직 자체 하이브리드 검색을 실행하지 않았습니다.');
+    const selected=recallInfo?.selected||[];
+    $('recallState').textContent+=selected.length?'\n'+selected.map(row=>`T${row.from}~T${row.to} · ${Number.isFinite(row.semantic)?'유사도 '+row.semantic.toFixed(3):'키워드 검색'}${row.keywords?.length?' · '+row.keywords.join(', '):''}`).join('\n'):'';
+    const bytes=value=>new TextEncoder().encode(JSON.stringify(value)).length,format=n=>n<1048576?`${(n/1024).toFixed(1)} KiB`:`${(n/1048576).toFixed(2)} MiB`;
+    $('storageUsage').textContent=`현재 대화 · 기록·보관함 ${format(bytes(C.stripDerivedState(state)))} · 벡터 캐시 ${format(bytes(await D.vectors(ctx.key)))} (JSON UTF-8 기준)`;
     notify((await config(true)).configWarning||state.lastError||lastStatus);
   }
   async function refreshEditor(readOnly=false){
     try{await loadEditor(readOnly);}catch(e){
       uiContext=null;uiState=null;
       $('chatTitle').textContent='현재 대화의 기억 편집을 사용할 수 없습니다: '+P.safeError(e);
-      $('entries').textContent='1:1 대화를 열면 현재 기억을 편집할 수 있습니다. 전역 설정과 저장된 기억 관리는 계속 사용할 수 있습니다.';
+      $('entries').textContent='대화를 열면 현재 기억을 편집할 수 있습니다. 저장된 기억은 아래에서 관리하세요.';
       for(const id of ['preview','recallPreview'])$(id).value='';
-      $('counts').textContent='';$('recallState').textContent='';$('effectiveSettings').textContent='현재 대화에는 기억 처리를 적용하지 않습니다.';
+      $('counts').textContent='';$('recallState').textContent='';$('storageUsage').textContent='';$('effectiveSettings').textContent='현재 대화에는 기억 처리를 적용하지 않습니다.';
       $('diagnostics').textContent=(await config(true)).configWarning||P.safeError(e);notify($('diagnostics').textContent);
     }
   }
@@ -747,7 +758,7 @@
   }
   function openSettings() {
     if(opening)return opening;
-    if(uiBusy){renderHealth();return api.showContainer('fullscreen');}
+    if(uiBusy){uiVisible=true;renderHealth();return api.showContainer('fullscreen');}
     opening=open().finally(()=>opening=null);return opening;
   }
   function requestHook() {
@@ -790,37 +801,34 @@
       #status{position:sticky;bottom:12px;z-index:11;border:1px solid #45627a;box-shadow:0 8px 28px #0005;background:#1a3043;font-size:14px}#status:empty{display:none}
       @media(max-width:600px){main{padding:14px 12px 64px}.toolbar{flex-wrap:wrap;padding:8px;gap:8px}.toolbar nav{width:100%}.toolbar nav button{flex:1;padding:8px 10px}.toolbar #saveSettings{width:100%;min-height:40px}header{padding-bottom:16px}h1{font-size:23px}section{padding:16px}.chunkEditor{padding:12px!important}#status{bottom:6px}}
 `+'</style>';
-    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v0.8.0</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
-      <div class="toolbar"><nav role="tablist" aria-label="설정 분류"><button id="tab-basic" role="tab" aria-controls="panel-basic">기본 설정</button><button id="tab-advanced" role="tab" aria-controls="panel-advanced">고급 설정</button><button id="tab-memory" role="tab" aria-controls="panel-memory">기억 관리</button></nav><button id="saveSettings">전체 설정 저장</button></div><section><h2>실행 환경 · 최근 기억 처리</h2><p id="hookStatus" role="status"></p><div class="row"><button id="ensureHook" class="secondary">주입 권한 확인·등록</button></div><small>이 상태는 이번 실행의 주입 훅 연결 여부입니다. 아래의 과거 기억 처리 기록과 별개이며, 훅 실행 확인은 요약·주입 자체의 성공을 뜻하지 않습니다. 권한 확인은 설정 저장·기억 호출 대기와 별도로 동작합니다.</small><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>중단하면 늦은 응답을 기록에 반영하지 않고 미요약 원문을 유지합니다. 서버 호출·과금 취소는 보장하지 않습니다. 이전 호출이 끝나기 전에는 같은 채팅에서 새 기억 호출을 시작하지 않습니다. 대기 중에도 이 설정창은 열 수 있습니다. 설정 저장·기록 수정·삭제는 진행 중인 작업이 끝난 뒤 처리하므로 필요하면 기다리기를 먼저 중단하세요.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄거나 탭을 이동하면 브라우저에서 요약 처리가 지연·중단될 수 있습니다. 복귀하면 저장된 구간을 확인하고 미처리 구간만 다시 요약합니다. 응답 대기 중에는 중복 재시도하지 않으며 자동으로 대기 시간을 제한하지 않습니다. 기기 재시작 후 미저장 구간을 재시도하면 API 비용이 다시 발생할 수 있습니다. 여러 기기의 동시 요약은 조정하지 않습니다. Risu 저장소는 실제 디스크 반영이 지연될 수 있어 기록 완료 직후 앱을 강제 종료하면 최근 기록이 남지 않을 수 있습니다.</p><p>API 요청은 Risu의 네트워크 설정을 따릅니다. 웹 환경에서 프록시를 사용하면 요청 내용과 인증정보가 해당 프록시를 경유할 수 있습니다. 연결 오류는 Risu의 직접 호출·프록시 설정도 확인하세요.</p></details></section>
-      <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic"><section><h2>플러그인 기본값 · 모듈에서 상속할 동작</h2><label><input id="enabled" type="checkbox"> 플러그인 기본값으로 기억 사용</label>
+    document.body.innerHTML=`<main><header><div><h1>Chronicle Memory <small>v1.0.0</small></h1><small>요약 연결 · 하이브리드 검색 · 사건 로그</small></div><button id="close" class="secondary">닫기</button></header>
+      <div class="toolbar"><nav role="tablist" aria-label="설정 분류"><button id="tab-basic" role="tab" aria-controls="panel-basic">기본 설정</button><button id="tab-advanced" role="tab" aria-controls="panel-advanced">고급 설정</button><button id="tab-memory" role="tab" aria-controls="panel-memory">기억 관리</button></nav><button id="saveSettings">전체 설정 저장</button></div><section><h2>실행 환경 · 최근 기억 처리</h2><p id="hookStatus" role="status"></p><div class="row"><button id="ensureHook" class="secondary">주입 권한 확인·등록</button></div><small>기억 주입 연결 상태입니다. 연결이 안 되면 권한 확인을 눌러주세요.</small><p id="health" role="status"></p><div class="row"><button id="stopWait" class="secondary" hidden>이번 기억 호출 기다리기 중단</button></div><small>늦은 응답은 저장하지 않습니다. 서버 호출·과금은 취소되지 않을 수 있으며, 이전 호출이 끝날 때까지 새 기억 호출을 보류합니다.</small><details><summary>환경 진단과 모바일 사용 안내</summary><p id="environment"></p><p>화면을 끄면 처리가 지연될 수 있습니다. 복귀 후 상태를 확인하세요. 여러 기기에서 동시에 요약하지 않는 것을 권장합니다.</p><p>연결 오류가 나면 Risu의 직접 호출·프록시 설정을 확인하세요. 요청은 설정된 프록시를 경유할 수 있습니다.</p></details></section>
+      <div id="panel-basic" role="tabpanel" aria-labelledby="tab-basic"><section><h2>기억 기본 설정</h2><label><input id="enabled" type="checkbox"> 플러그인 기본값으로 기억 사용</label>
       <div class="grid"><label>요약 주기 (완료 턴)<input id="interval" type="number" min="5" max="20"></label>
       <label id="localRawSettings">유지할 최근 원문 (단독·자체 하이브리드)<input id="recent" type="number" min="5" max="20"></label>
       <label id="localRawTrim">원문 자르기 방식<select id="rawTrim"><option value="rolling">매 턴 이동 (기본)</option><option value="chunk">청크 커밋 시 이동 (계단식)</option></select></label>
       <label id="localSummaryTarget">턴당 평균 요약 목표 (단독·자체 하이브리드)<input id="charsPerTurn" type="number" min="50" max="200"></label>
-      <label>구간 응답 토큰 상한/목표<input id="maxOutputTokens" type="number" min="128" max="8192"></label>
+      <label>요약 응답 예산 (토큰)<input id="maxOutputTokens" type="number" min="128" max="8192"></label>
       <label>원문 처리<select id="mode"><option value="standalone">단독 · 누적 로그 + 최근 원문</option><option value="hybrid">자체 하이브리드 · 단독 + 청크 검색</option><option value="risu">Risu 기억 병행 · 하이파 주력</option></select></label>
       <label>요청당 최대 요약 묶음<input id="batchesPerRequest" type="number" min="1" max="20"></label>
       <label>요약 대기 방식<select id="summaryBlocking"><option value="wait">기다림 · 요약 후 RP 전송 (기본)</option><option value="nonblocking">기다리지 않음 · 요약은 뒤에서 진행</option></select></label>
       </div>
-      <p><strong>요약 대기 방식 · 기다리지 않음</strong>은 기본 꺼짐입니다. 켜면 요약이 필요한 턴에도 RP 요청을 바로 보내고 요약은 뒤에서 진행합니다. 대신 <strong>새 청크 반영이 한 턴 늦어지고, 그 턴은 미요약 원문이 그대로 들어가 입력이 늘어납니다.</strong> 요약이 끝나면 요약한 구간의 원문이 그대로인지 확인한 뒤 저장하며, 그 구간이 수정·재생성되었거나 대화가 바뀌었으면 저장하지 않고 나중에 다시 요약합니다. 자동 시간제한은 없습니다. 휴대폰 화면을 끄는 등으로 요약이 끝나지 않으면 같은 대화의 다음 요약은 시작하지 않고 원문을 유지하므로, 설정창의 ‘기다리기 중단’을 누르세요. RP 요청과 요약 요청이 동시에 나가므로 제공자의 동시 요청 한도에 걸릴 수 있습니다.</p>
-      <p id="rawTrimHelp">매 턴 이동은 최근 N턴을 매번 유지합니다. 계단식은 마지막 요약 완료 지점에서 N턴을 남기고 새 원문을 덧붙이다가 다음 청크 저장 시 한 번에 자릅니다. 주기 5·최근 원문 5라면 정상 진행 중 5~9턴(평균 약 7턴)이 남습니다. 실패·중단·따라잡기 중에는 더 남습니다. 평균 입력이 늘지만 원문 앞부분이 유지돼 캐시 활용에 유리할 수 있습니다. 실제 적중·비용 절감은 제공자와 Risu의 프롬프트·캐시 설정에 따라 달라집니다. 설정 변경·원문 수정·백업 복원 시에는 범위를 다시 계산합니다.</p><div id="hybridSettings" hidden><h3>자체 하이브리드 전용 · 누적 로그 주입 범위</h3><div class="grid">
+      <p><strong>기다리지 않음</strong>은 RP를 바로 보내고 요약을 뒤에서 진행합니다. 새 기억은 완료 후 다음 요청부터 반영하며, 대기 중에는 미요약 원문을 보냅니다.</p>
+      <p id="rawTrimHelp">매 턴 이동은 최근 원문 범위를 매번 갱신하고, 계단식은 새 청크를 저장할 때 갱신합니다.</p><div id="hybridSettings" hidden><h3>자체 하이브리드 전용 · 누적 로그 주입 범위</h3><div class="grid">
       <label>하이브리드 누적 로그 주입<select id="hybridLogScope"><option value="all">누적 로그 전체 (기본)</option><option value="recent">최근 K청크 + 오래된 청크는 검색으로만</option></select></label>
       <label id="hybridChunkCount">최근 청크 수 K (1~100)<input id="hybridRecentChunks" type="number" min="1" max="100"></label></div>
-      <p>300~500턴 이상 초장편에서 누적 로그 입력을 줄이고 싶을 때만 사용하세요. 최근 K청크를 넘는 오래된 청크는 매번 넣지 않고 검색·재강조로만 들어갑니다. <strong>현재 장면과 표현이 다른 오래된 약속·설정은 검색에 걸리지 않아 누락될 수 있습니다.</strong> 저장 로그·백업·편집은 전체 기록을 유지하며, 단독 모드는 검색 보완이 없어 항상 전체를 주입합니다.</p></div><div id="risuSettings" hidden><h3>Risu 기억 병행 전용</h3><div class="grid">
+      <p>최근 K청크를 항상 보내고 오래된 기록은 검색으로 보완합니다. 검색되지 않은 기록은 빠질 수 있으며, 저장된 전체 기억은 유지합니다.</p></div><div id="risuSettings" hidden><h3>Risu 기억 병행 전용</h3><div class="grid">
       <label>병행 턴당 요약 목표 (10~200글자)<input id="risuCharsPerTurn" type="number" min="10" max="200"></label>
       <label>병행 연대기 주입<select id="risuLogScope"><option value="all">누적 로그 전체 (기본)</option><option value="recent">최근 K청크</option><option value="none">기록만 · 주입 안 함</option></select></label>
       <label id="risuChunkCount">최근 청크 수 K<input id="risuRecentChunks" type="number" min="1" max="100"></label></div>
-      <p>하이파 등 내장 기억을 Risu에서 직접 켜세요. 원문과 과거 세부 검색은 Risu에 맡기며 이 플러그인은 원문을 자르거나 복원하지 않습니다. 연대기는 저장 원문에서 위 요약 주기마다 새 구간만 압축합니다. 기본 5턴 × 50글자면 본문 약 250글자이며 중요한 사실·추가 지침 때문에 넘겨도 수용합니다.</p>
-      <p>전체 로그는 계속 저장합니다. 최근 K청크·기록만은 주입 범위만 바꾸며 백업·편집은 전체 기록을 유지합니다. 이미 저장한 로그는 다시 압축하지 않고 새 구간부터 병행 전용 목표를 적용합니다. 전체 주입 시 누적 로그만큼 입력은 늘며, 연대기는 내장 기억 처리 뒤에 추가되므로 최종 컨텍스트 여유를 Risu에서 확보하세요. 내장 기억이 먼저 제외한 미요약 원문을 연대기가 되살리지는 않습니다.</p></div>
-      <label><input id="cleanSummaryInput" type="checkbox"> 요약 입력 정리: 이미지·BGM 등 장식 정리 · {{user}}/{{char}} 이름 치환 · 구조화 상태 원문 유지</label>
+      <p>하이파 등 내장 기억을 Risu에서 직접 켜세요. Risu가 원문·검색을 관리하고 연대기가 짧은 사건 기록을 더합니다.</p>
+      <p>주입 범위는 전달할 기록만 바꿉니다. 저장·백업은 전체 기록을 유지합니다.</p></div>
+      <label><input id="cleanSummaryInput" type="checkbox"> 요약 입력 정리 · 장식 제거와 이름 치환</label>
 
-      <details class="help"><summary>분량·원문·모듈 설정 안내</summary><p>구간 본문 권장 목표 = 요약 주기 × 해당 모드의 턴당 평균 글자 수. 중요한 사실·추가 지침 때문에 목표를 넘겨도 정상 요약은 자르거나 버리지 않고 저장합니다. 날짜·시간 표시와 제목·키워드는 본문 목표에서 제외합니다. 한 턴마다 같은 분량을 강제하지 않습니다. JSON 오류·잘못된 턴 범위·빈 본문·응답 잘림은 실패로 처리합니다. 단독·자체 하이브리드는 미요약 원문을 더 남기며, 병행의 원문 보존은 Risu 설정을 따릅니다.</p>
-      <p>입력 정리는 알려진 표시용 장식을 정리하며 상태 JSON·사용자 정의 태그의 의미를 해석하지 않습니다. 정리를 끄면 원문 그대로 요약합니다. 작품별 상태 해석·언어·기록 우선순위는 추가 요약 지침에 적으세요. 원본 저장·전체 원문 변경 감지는 유지합니다.</p>
-      <p>1턴 = 완료된 AI 응답 1개. 사용자 입력 없이 별도 메시지로 진행해도 각각 셉니다. 첫 인사와 같은 메시지의 이어쓰기·재생성은 추가 턴이 아닙니다. <strong>단독·자체 하이브리드는 Risu 내장 기억을 끄고, Risu 기억 병행은 하이파 등 내장 기억을 직접 켜세요.</strong> 병행에서는 자체 자동 검색·원문 자르기를 하지 않습니다.</p>
-      <p>Risu 모델 호출은 Risu의 전역 출력 설정을 사용합니다. 위 토큰 수는 프롬프트 목표이며, 외부 API에서만 요청 필드로 전달합니다.</p>
-      <p>전체 컨텍스트와 출력 토큰은 Risu·사용하는 API에서 설정합니다. 기본은 누적 로그 전체 주입이며 병행에서만 주입 범위를 선택할 수 있습니다. 별도의 누적 로그 글자 상한이나 응답 대기 시간 제한은 없습니다. 기록을 자동 삭제·병합·재요약하지 않습니다.</p>
-      <p>모듈의 <strong>플러그인 기본값</strong>은 이 설정 전체를 따릅니다. <strong>모듈설정 사용</strong>은 기억을 켜고 모듈 입력값을 적용하며, 빈칸·잘못된 항목은 이 기본값을 따릅니다. <strong>중지</strong>는 요약·주입·검색을 멈춥니다. 변경은 다음 요청부터 반영됩니다.</p></details><small id="effectiveSettings"></small><p id="diagnostics" style="white-space:pre-wrap;overflow-wrap:anywhere" role="status"></p></section>
-      <section><h2>요약 모델 연결 · 새 사건 청크 생성</h2><p>인증정보는 이 기기의 Risu 저장소에 보관하지만 다른 설치 플러그인과 격리된 금고는 아닙니다. 신뢰하는 플러그인만 사용하고 외부 연결에는 전용 키·최소 권한 계정을 권장합니다. Risu 내부 모델 연결은 연대기에 별도 키를 저장하지 않습니다.</p>
+      <details class="help"><summary>설정 안내</summary><p>1턴은 완료된 AI 응답 1개입니다. 요약 분량은 권장 목표이며, 중요한 기록은 목표를 넘어도 보존합니다.</p>
+      <p>단독·하이브리드는 Risu 내장 기억을 끄고, 병행 모드는 내장 기억을 직접 켜세요. 전체 컨텍스트와 출력 예산은 Risu·API에서 설정합니다.</p>
+      <p>모듈의 ‘플러그인 기본값’은 이 설정을 따릅니다. 변경은 다음 요청부터 적용하며, 기존 기억은 자동으로 다시 요약하지 않습니다.</p></details><small id="effectiveSettings"></small><p id="diagnostics" style="white-space:pre-wrap;overflow-wrap:anywhere" role="status"></p></section>
+      <section><h2>요약 모델 연결</h2><p>인증정보는 이 기기에 보관하며 기억 백업에서는 제외합니다. 신뢰하는 플러그인과 API 연결을 사용하세요.</p>
       <label>제공자<select id="provider">${Object.entries(P.LABELS).map(([id,name])=>`<option value="${id}">${name}</option>`).join('')}</select></label>
       <div id="nativeOptions"><p>Risu 설정에 지정한 모델·키로 별도 요약 호출을 합니다. 보조모델과 기억 전용모델을 구분해서 선택하세요.</p>
       <label><input id="allowPlugins" type="checkbox"> 다른 플러그인이 제공하는 Risu 모델 호출 허용</label></div>
@@ -837,61 +845,58 @@
       <small>모델 목록은 해당 제공자에서 조회합니다. 목록에 있어도 프로젝트·리전별 실제 호출 권한은 연결 시험으로 확인하세요.</small>
       <div id="tokenPanel"><label>토큰 필드<select id="tokenField"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label></div>
       <div id="versionPanel"><label>Anthropic API 버전<input id="anthropicVersion"></label></div></div>
-      <label>추가 요약 지침 · 문체와 기록 우선순위<textarea id="customPrompt" rows="4" placeholder="예: 관계 변화·약속·취향을 우선하고 요약은 한국어로 작성"></textarea></label><small>청크 제목·기록 내용·키워드는 기본 형식이며 시점 표현은 선택입니다. 추가 지침에는 JSON 형식을 바꾸는 지시 대신 기록할 내용의 우선순위를 적으세요.</small>
-      <label>요약 시 직전 청크 참고<select id="summaryContext"><option value="previous">사용 · 직전 청크 제목과 마지막 사건 1~2개 (기본)</option><option value="none">사용 안 함 · 새 구간만 전달 (v0.7.9 방식)</option></select></label><small>청크 경계에서 대명사·“다음 날” 같은 상대 시점·진행 중인 약속이 끊기지 않도록, 저장된(수동 수정 포함) 직전 청크의 제목·턴 범위·마지막 사건 1~2줄만 참고용으로 함께 보냅니다. 요약 모델에는 다시 기록하지 말라고 지시하며 기존 청크는 바뀌지 않습니다. 입력이 조금 늘어납니다.</small>
+      <label>추가 요약 지침 · 문체와 기록 우선순위<textarea id="customPrompt" rows="4" placeholder="예: 관계 변화·약속·취향을 우선하고 요약은 한국어로 작성"></textarea></label><small>기록할 내용과 언어·문체를 지정하세요. 기본 출력 형식은 유지합니다.</small>
+      <label>요약 시 직전 청크 참고<select id="summaryContext"><option value="previous">사용 (기본)</option><option value="none">사용 안 함</option></select></label><small>직전 사건을 참고해 인물·시점·약속의 연결을 돕습니다. 기존 기록은 바꾸지 않습니다.</small>
       <label>요약 지침 프리셋<select id="promptPreset"></select></label>
       <div class="row"><button id="loadPromptPreset" class="secondary">선택 지침 불러오기</button></div>
-      <small>선택만으로는 지침이 바뀌지 않습니다. 불러오기는 위 편집칸을 교체하며, ‘전체 설정 저장’ 후 새 요약부터 적용합니다. 기존 요약은 다시 만들지 않습니다.</small>
+      <small>불러온 지침은 ‘전체 설정 저장’ 후 새 요약부터 적용합니다.</small>
       <details><summary>지침 프리셋 저장·관리</summary>
       <label>프리셋 이름<input id="promptPresetName" placeholder="예: 단독용 / 하이파 병행용"></label>
       <div class="row"><button id="newPromptPreset" class="secondary">새 프리셋 저장</button><button id="updatePromptPreset" class="secondary">선택 프리셋 수정</button><button id="deletePromptPreset" class="secondary">선택 프리셋 삭제</button></div>
-      <small id="promptPresetCount"></small><p>위 편집칸의 지침을 보관합니다. 수정은 선택한 프리셋의 이름과 내용을 바꿉니다. 프리셋 저장·수정은 현재 적용 지침이나 API 연결 설정을 저장하지 않습니다. 모드 변경 시 자동 전환하지 않습니다.</p>
-      <p>프리셋은 이 Risu 저장 환경에서 채팅 간에 공유하며 다시 열어도 남습니다. 채팅 기억 삭제와 별도로 관리하고 기억 JSON 백업에는 포함하지 않습니다. 빈 지침도 저장할 수 있습니다.</p>
+      <small id="promptPresetCount"></small><p>위 지침을 이름으로 보관합니다. API 연결과 현재 적용값은 바꾸지 않습니다.</p>
+      <p>지침 프리셋은 채팅 간에 공유하며 기억 JSON 백업과는 별도로 보관합니다.</p>
       <div id="promptDeleteConfirmation" hidden tabindex="-1" role="group" aria-label="지침 프리셋 삭제 확인"><p id="promptDeleteTarget"></p><p>선택한 프리셋만 삭제합니다. 현재 편집 중이거나 적용된 지침은 유지합니다.</p><div class="row"><button id="confirmPromptDelete">프리셋 삭제 확인</button><button id="cancelPromptDelete" class="secondary">취소</button></div></div></details>
       <div class="row"><button id="testConnection" class="secondary">요약 연결 시험 · 짧은 모델 호출</button></div>
       <p>연결 시험은 별도 모델 호출이며 소액 과금될 수 있습니다. API 키·서비스 계정 JSON은 기억 백업에 포함하지 않습니다.</p></section>
-      <details class="introHelp"><summary>처음 사용하시나요? · 기억 처리 방식 안내</summary><p>대화 원문을 설정한 턴 수만큼 묶어 짧은 사건 기록으로 바꾸고, 이전 사건 기록 전체와 최근 원문을 다음 RP 요청에 함께 보냅니다. 오래된 로그를 반복해서 다시 요약하지 않습니다.</p>
-      <p><strong>단독·자체 하이브리드: 기본 5턴마다 기록 · 최근 원문 5턴.</strong> 완료된 대화가 12턴이고 T1~T10을 기록했다면, 누적 사건 로그 T1~T10 + 원문 T8~T12 + 현재 입력을 보냅니다. 요약 실패·미처리 구간은 원문으로 더 남깁니다. <strong>원문 자르기 → 청크 커밋 시 이동</strong>을 선택하면 같은 조건에서 원문 T6~T12를 유지하고, 다음 T11~T15 청크가 저장되면 원문 T11~T15로 이동합니다.</p>
-      <p><strong>Risu 기억 병행 · 하이파 주력</strong>은 원문 관리와 과거 검색을 Risu에 맡기고, 같은 주기로 만든 짧은 연대기를 덧붙입니다. 기본은 턴당 50글자 목표·누적 로그 전체 주입이며 최근 K청크·기록만도 선택할 수 있습니다. 기존 단독·자체 하이브리드 설정은 그대로 유지합니다.</p>
-      <p><strong>단독</strong>은 위 구성을 사용합니다. <strong>하이브리드</strong>는 여기에 현재 대화와 관련된 요약 청크를 골라 최근 입력 가까이에 다시 보여줍니다. 오래된 원문은 검색하거나 다시 넣지 않습니다. 임베딩은 모델 내부 어텐션을 직접 조절하지 않습니다.</p>
-      <p>청크 예: <strong>다음 만남의 약속 (1–5턴)</strong><br>다음 날 저녁 — 두 사람이 서점 앞에서 다시 만나기로 함.<br>요약 모델은 새 구간 전체만 읽고, 턴마다 따로 나누지 않고 사건별로 묶습니다. 시점은 원문에서 확인한 표현만 기록하며 없으면 생략합니다.</p>
-      <p>1턴은 완료된 AI 응답 1개입니다. 사용자 입력 없이 별도 메시지로 진행한 응답도 각각 셉니다. 첫 인사·미응답 입력은 세지 않고, 같은 메시지에 붙인 이어쓰기·재생성은 턴 수를 늘리지 않습니다. 요약은 다음 RP 요청 직전에 별도로 호출하므로 비용·대기 시간이 추가될 수 있습니다. 원문 대화 자체는 삭제하지 않습니다. 전체 설정 저장 버튼과 모델 목록 조회는 이 화면 전체 설정을 함께 저장합니다.</p></details>
+      <details class="introHelp"><summary>기억 처리 방식</summary><p>대화를 짧은 사건 기록으로 묶어 최근 원문과 함께 보냅니다. 오래된 기록은 반복해서 다시 요약하지 않습니다.</p>
+      <p><strong>단독</strong>은 누적 기록과 최근 원문, <strong>하이브리드</strong>는 관련 기록 검색, <strong>Risu 기억 병행</strong>은 내장 기억에 연대기를 더합니다.</p>
+      <p>기본은 5턴마다 요약·최근 원문 5턴 유지입니다. 저장 원문은 삭제하지 않으며, 요약에 별도 호출 비용과 대기 시간이 발생할 수 있습니다. 자세한 사용법은 README_KO.md를 참고하세요.</p></details>
       </div><div id="panel-advanced" role="tabpanel" aria-labelledby="tab-advanced" hidden><section><h2>하이브리드 검색 연결 · 요약 청크 재강조</h2>
-      <p>요약 모델과 별도의 임베딩 모델을 지정합니다. 새로 만든 청크만 색인하고, 매턴 현재 입력·직전 대화 일부와 비교합니다. 단독 모드의 자동 요청에서는 임베딩 API를 호출하지 않습니다. 아래 연결·검색 시험은 모드와 무관하게 직접 실행합니다.</p>
+      <p>관련 사건 기록을 찾는 임베딩 모델입니다. 자체 하이브리드 모드에서 사용합니다.</p>
       <label>임베딩 제공자<select id="embeddingProvider"><option value="gemini">Gemini AI Studio</option><option value="openai">OpenAI</option><option value="voyage">Voyage AI</option><option value="vertex">Vertex AI · Google 임베딩</option><option value="external">직접 입력 · OpenAI 호환 임베딩</option></select></label><small id="embeddingAddressHelp"></small>
-      <small>Risu에 등록된 임베딩 모델 직접 호출은 현재 공개 API에서 확인되지 않아 지원하지 않습니다. 외부 API를 연결하세요. Anthropic 대화 모델은 임베딩 모델로 사용하지 않습니다.</small>
+      <small>임베딩 전용 외부 API를 연결하세요.</small>
       <label id="embeddingReusePanel"><input id="embeddingReuseCredential" type="checkbox"> 같은 제공자에 저장한 요약 연결 인증정보 재사용</label><small id="embeddingCredentialState"></small><div id="embeddingBinding" hidden><p id="embeddingBindingState"></p><button id="bindEmbeddingKey" class="secondary">현재 주소에 이 키 연결</button></div>
       <div id="embeddingSeparateSecret"><small id="embeddingSecretHelp"></small><label>임베딩 전용 API 키 / 서비스 계정 JSON<input id="embeddingSecret" type="password" autocomplete="off"></label><label><input id="embeddingShowSecret" type="checkbox"> 인증정보 표시</label><label><input id="embeddingClearSecret" type="checkbox"> 이 제공자의 임베딩 전용 인증정보 삭제</label></div>
       <div id="embeddingEndpointPanel"><label>임베딩 API 기본 주소 또는 /embeddings 전체 주소<input id="embeddingEndpoint" placeholder="https://your-provider.example/v1"></label></div>
       <div id="embeddingVertexPanel" class="grid"><label>임베딩 프로젝트 ID · 빈칸이면 JSON 값<input id="embeddingProject"></label><label>임베딩 리전<input id="embeddingLocation"></label><label>Vertex 호출 형식<select id="embeddingVertexMethod"><option value="predict">predict · 텍스트 임베딩 모델</option><option value="embedContent">embedContent · 이를 지원하는 모델</option></select></label></div>
       <div class="row"><button id="loadEmbeddingModels" class="secondary">임베딩 모델 목록 불러오기</button></div>
       <label>선택 가능한 임베딩 모델<select id="embeddingModelSelect"></select></label><label>임베딩 모델 ID · 직접 수정 가능<input id="embeddingModel"></label>
-      <small>Voyage는 공식 문서 기준의 내장 기본 목록이며 실시간 권한 조회가 아닙니다. 다른 제공자는 서버에서 조회합니다. 직접 입력 서버의 목록에는 임베딩 외 모델도 있을 수 있습니다. 모델·키·Vertex 리전의 실제 호출 가능 여부는 연결 시험으로 확인하세요.</small>
+      <small>모델의 사용 가능 여부는 연결 시험으로 확인하세요.</small>
       <details><summary>검색 재강조 범위</summary><div class="grid"><label>최대 재강조 청크 수 (1~8)<input id="recallTopK" type="number" min="1" max="8"></label><label>다시 보여줄 기록의 최대 길이 (200~8000글자)<input id="recallCharBudget" type="number" min="200" max="8000"></label><label>의미 유사도 최소값 (0~1)<input id="recallMinSimilarity" type="number" min="0" max="1" step="0.05"></label><label>요청당 새로 색인할 청크 수 (1~32)<input id="embeddingBatchesPerRequest" type="number" min="1" max="32"></label></div><small>이 길이는 관련 기록을 추가로 반복해 보여주는 분량입니다. 누적 로그 전체는 별도로 계속 보냅니다.</small></details>
-      <p>순위 = 의미 유사도 80% + 키워드 일치 비율 20%. 의미 기준을 넘거나 키워드가 일치한 청크만 후보로 삼습니다. 최근 원문 안에 완전히 포함된 청크는 재강조에서 제외하며, 예산에 청크 전체가 들어갈 때만 추가합니다. 검색 모델이 다르면 적절한 유사도 기준도 달라집니다.</p>
-      <p>임베딩 미설정·실패 시 키워드 검색으로 계속하고 경고를 남깁니다. 과거 사실이 지금도 유효하다는 뜻은 아니므로 이후 변경 기록을 우선합니다. 모델 변경·청크 편집 시 필요한 벡터를 다시 만들며, 기존 요약은 다시 생성하지 않습니다.</p>
+      <p>의미 유사도와 키워드로 관련 청크를 고릅니다. 최근 원문에 포함된 기록은 제외합니다.</p>
+      <p>임베딩 연결이 없거나 실패하면 키워드 검색으로 이어갑니다. 이후 변경된 기록을 우선합니다.</p>
       <div class="row"><button id="saveEmbeddingSettings">전체 설정 저장</button><button id="testEmbedding" class="secondary">임베딩 연결 시험</button><button id="previewRecall" class="secondary">현재 대화 검색 시험</button><button id="resetEmbeddings" class="secondary">활성 청크 벡터 초기화</button></div>
-      <p>연결·검색 시험은 API 호출 비용이 발생할 수 있습니다. 인증정보는 이 기기에만 보관하고 백업에서 제외합니다. 벡터는 요약과 분리한 검색 캐시에 보관하며 변경할 때만 저장합니다. 질의 벡터는 실행 중 메모리에만 두고, 기억 삭제 시 해당 검색 캐시도 함께 지웁니다.</p></section>
+      <p>연결·검색 시험은 호출 비용이 발생할 수 있습니다. 검색 캐시는 요약 기록과 별도로 관리합니다.</p></section>
       <section><h2>요약·검색 입력 정리</h2><details id="filterPanel"><summary>사용자 지정 제거 정규식 · 요약·검색 입력 전용</summary>
-      <p>OOC·텍스트 상태창처럼 봇마다 다른 노이즈를 요약 모델과 하이브리드 검색 쿼리에 보내기 전에 지웁니다. 실제 저장 원문·RP 요청·원문 변경 감지는 바꾸지 않습니다. 적용 순서는 입력 정리 → {{user}}/{{char}} 치환 → 아래 규칙 순이며, 규칙은 입력 정리 사용 여부와 관계없이 켠 것만 적용합니다. 일치한 부분을 빈 문자열로 바꿉니다.</p>
-      <p>최대 ${C.FILTER_LIMIT}개 · 패턴 ${C.FILTER_PATTERN_LIMIT}글자 이하 · g/i/m/s/u 플래그. RE2 엔진으로 실행하며 전방탐색·역참조 등 지원하지 않는 문법과 너무 복잡한 패턴은 저장하지 않습니다. Unicode 문자 기준으로 처리하며 실행 오류 규칙은 건너뜁니다.</p>
-      <p><strong>단순한 패턴을 권장합니다.</strong> 예: <code>\\[OOC[^\\]]*\\]</code>처럼 고정 문자 + 부정 문자 클래스로 끝을 정하세요. RE2 지원 문법은 일반 JavaScript 정규식과 일부 다릅니다. 미리보기에서 실제로 지워지는 내용을 확인한 뒤 저장하세요.</p>
+      <p>OOC·상태창 등 불필요한 부분을 요약·검색 입력에서 제거합니다. 저장 원문과 RP 요청은 그대로 유지합니다.</p>
+      <p>최대 ${C.FILTER_LIMIT}개 · g/i/m/s/u 지원. 전방탐색·역참조는 사용할 수 없습니다.</p>
+      <p>예: <code>\\[OOC[^\\]]*\\]</code>. 미리보기로 제거 결과를 확인한 뒤 저장하세요.</p>
       <div id="filterRows"></div><small id="filterCount"></small>
       <div class="row"><button id="addFilter" class="secondary">제거 규칙 추가</button></div>
       <label>미리보기 샘플 텍스트 · 제거 전<textarea id="filterSample" rows="4" placeholder="예: 그녀가 웃었다. [OOC: 다음 장면으로]"></textarea></label>
       <div class="row"><button id="previewFilters" class="secondary">제거 결과 미리보기</button></div>
       <label>제거 후<textarea id="filterResult" rows="4" readonly></textarea></label><small id="filterState" style="white-space:pre-wrap"></small></details></section></div><div id="panel-memory" role="tabpanel" aria-labelledby="tab-memory" hidden><section><h2>현재 대화의 기억</h2><p id="chatTitle"></p><div class="row"><button id="reload" class="secondary">현재 대화 불러오기</button><button id="generate">미처리 구간 요약</button><button id="saveLog">수정한 로그 저장</button></div>
-      <p>자동 처리는 새 구간을 덧붙입니다. 원문이 달라진 구간은 보관함으로 이동하며 RP에는 주입하지 않습니다. ‘이 청크만 다시 요약’은 직접 누를 때만 실행하며 자동으로 다시 요약하지 않습니다.</p>
-      <section id="resummarizeConfirmation" hidden tabindex="-1" aria-labelledby="resummarizeTitle"><h2 id="resummarizeTitle">청크 다시 요약 확인</h2><p id="resummarizeTarget"></p><p>저장된 현재 설정(요약 모델·추가 지침·직전 청크 참고)으로 이 구간만 다시 요약합니다. <strong>요약 API 호출 비용이 발생합니다.</strong> 뒤의 청크는 다시 요약하지 않으며, 바뀌기 전 청크는 보관함에 ‘사용자 재요약’으로 남습니다. 실패·중단하면 기존 청크를 그대로 둡니다. 설정창에서 바꾸고 저장하지 않은 설정은 반영하지 않습니다.</p><div class="row"><button id="confirmResummarize">다시 요약 실행</button><button id="cancelResummarize" class="secondary">취소</button></div></section><div id="entries"></div>
+      <p>새 사건은 순서대로 덧붙입니다. 바뀐 원문의 기존 기억은 보관함으로 옮깁니다.</p>
+      <section id="resummarizeConfirmation" hidden tabindex="-1" aria-labelledby="resummarizeTitle"><h2 id="resummarizeTitle">청크 다시 요약 확인</h2><p id="resummarizeTarget"></p><p>현재 저장한 설정으로 이 청크만 다시 요약합니다. <strong>API 호출 비용이 발생합니다.</strong> 이전 기록은 보관하며, 실패·중단하면 기존 청크를 유지합니다.</p><div class="row"><button id="confirmResummarize">다시 요약 실행</button><button id="cancelResummarize" class="secondary">취소</button></div></section><div id="entries"></div>
       <div class="row"><button id="export" class="secondary">현재 대화 JSON 백업</button><button id="importButton" class="secondary">JSON 복원</button><input id="importFile" type="file" accept="application/json,.json" hidden></div>
-      <div id="backupReady" hidden><p>백업 준비 완료 · 아래 링크를 직접 눌러 저장하세요. 파일 저장이 안 되면 JSON 전체를 복사해 별도로 보관할 수 있습니다.</p><div class="row"><a id="backupDownload" class="downloadLink" download="Chronicle_Memory_Backup.json" hidden>JSON 파일 저장</a><button id="selectBackup" class="secondary">JSON 전체 선택</button></div><textarea id="backupText" rows="8" readonly aria-label="백업 JSON 전체"></textarea><small>선택한 JSON에는 대화의 요약 기록이 들어 있습니다. 파일 앱에서 저장 결과를 확인하세요.</small></div>
-      <p>복원 시 현재 원문과 맞는 구간만 활성화합니다. 기존 기억은 보관함에 남습니다. API 키·벡터·검색 결과는 백업하지 않으며 필요하면 다시 색인합니다.</p></section>
-      <section><h2>누적 로그 · 검색 재강조 미리보기</h2><small id="counts"></small><textarea id="preview" rows="10" readonly></textarea><p id="recallState"></p><textarea id="recallPreview" rows="7" readonly placeholder="하이브리드에서 선택된 기존 요약 청크"></textarea></section><section id="deleteConfirmation" hidden tabindex="-1" aria-labelledby="deleteTitle"><h2 id="deleteTitle">저장 기억 삭제 확인</h2><p id="deleteTarget"></p><p>표시한 대상의 Chronicle 요약·보관함·검색 캐시를 삭제합니다. 원문 대화·설정·API 키는 유지합니다. 별도 백업이 없으면 삭제한 기억은 복구할 수 없습니다.</p><div class="row"><button id="confirmDelete">삭제 확인</button><button id="cancelDelete" class="secondary">취소</button></div></section><div id="memoryCacheAnchor"></div></div><p id="status" role="status" aria-live="polite"></p></main>`;
+      <div id="backupReady" hidden><p>백업을 저장하거나 JSON을 복사해 보관하세요.</p><div class="row"><a id="backupDownload" class="downloadLink" download="Chronicle_Memory_Backup.json" hidden>JSON 파일 저장</a><button id="selectBackup" class="secondary">JSON 전체 선택</button></div><textarea id="backupText" rows="8" readonly aria-label="백업 JSON 전체"></textarea><small>선택한 JSON에는 대화의 요약 기록이 들어 있습니다. 파일 앱에서 저장 결과를 확인하세요.</small></div>
+      <p>현재 원문과 일치하는 기억을 복원하고 기존 기록은 보관합니다. API 키와 검색 캐시는 백업에 포함하지 않습니다.</p></section>
+      <section><h2>누적 로그 · 검색 재강조 미리보기</h2><small id="counts"></small><textarea id="preview" rows="10" readonly></textarea><details><summary>검색·저장 정보</summary><p id="recallState" style="white-space:pre-wrap"></p><small id="storageUsage"></small></details><textarea id="recallPreview" rows="7" readonly placeholder="하이브리드에서 선택된 기존 요약 청크"></textarea></section><section id="deleteConfirmation" hidden tabindex="-1" aria-labelledby="deleteTitle"><h2 id="deleteTitle">저장 기억 삭제 확인</h2><p id="deleteTarget"></p><p>표시한 대상의 Chronicle 요약·보관함·검색 캐시를 삭제합니다. 원문 대화·설정·API 키는 유지합니다. 별도 백업이 없으면 삭제한 기억은 복구할 수 없습니다.</p><div class="row"><button id="confirmDelete">삭제 확인</button><button id="cancelDelete" class="secondary">취소</button></div></section><div id="memoryCacheAnchor"></div></div><p id="status" role="status" aria-live="polite"></p></main>`;
     $('memoryCacheAnchor').insertAdjacentHTML('beforebegin',`<section><h2>저장된 기억 · 캐시 관리</h2>
-      <p>요약과 수동 편집 내용은 Risu 저장 데이터 안에 채팅별로 자동 보관합니다. 같은 채팅으로 돌아오면 JSON 파일 없이 다시 읽습니다. 별도의 txt 파일을 직접 찾아 지울 필요는 없습니다.</p>
+      <p>기억은 채팅별로 자동 저장되며 돌아오면 다시 불러옵니다.</p>
       <label><input id="autoRestoreCache" type="checkbox"> 같은 캐릭터의 새 분기에서 공통 원문이 일치하는 기억 자동 재사용</label>
-      <small>다른 내용의 새 채팅에는 과거 기록을 자동으로 붙이지 않습니다. 이 옵션을 끄더라도 각 채팅 자체의 저장 기록은 자동으로 불러옵니다.</small>
-      <p><strong>삭제 위치:</strong> Risu 설정 → Chronicle Memory → 이 ‘저장된 기억 · 캐시 관리’ 영역. 삭제하면 선택한 기록과 보관함을 함께 지우며 원문·API 연결은 유지합니다. 다른 분기에 같은 기록이 남을 수 있으니 모두 없애려면 전체 삭제를 사용하세요.</p>
+      <small>같은 원문을 공유하는 분기에서만 기억을 재사용합니다.</small>
+      <p>선택한 기억과 보관함을 함께 삭제합니다. 원문 대화와 API 연결은 유지합니다.</p>
       <small id="cacheCount"></small><label>저장된 채팅<select id="cacheSelect"></select></label>
       <textarea id="cachePreview" rows="7" readonly placeholder="선택한 채팅의 사건 로그를 여기에서 확인할 수 있습니다."></textarea>
       <div class="row"><button id="reloadCaches" class="secondary">목록 새로고침</button><button id="reuseCache" class="secondary">선택 기록의 공통 구간 불러오기</button><button id="deleteCache" class="secondary">선택 기록 삭제</button><button id="deleteCurrent" class="secondary">현재 채팅 기억 삭제</button><button id="deleteAllCaches" class="secondary">전체 기억 삭제</button></div>
@@ -978,7 +983,7 @@
       try{await resummarize(target);}finally{try{await loadEditor();await loadCaches();}catch{}}
       notify(lastStatus);
     });
-    $('close').onclick=()=>{clearDelete();clearPromptDelete();clearResummarize();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
+    $('close').onclick=()=>{uiVisible=false;renderHealth();clearDelete();clearPromptDelete();clearResummarize();E.releaseBackup(preparedBackup);preparedBackup=null;return api.hideContainer();};
     $('selectBackup').onclick=()=>{$('backupText').focus();$('backupText').select();$('backupText').setSelectionRange(0,$('backupText').value.length);notify('JSON 전체를 선택했습니다. 기기의 복사 기능으로 보관하세요.');};
     action('saveSettings',saveSettings);
     action('saveEmbeddingSettings',saveSettings);
@@ -1086,7 +1091,7 @@
     $('environment').textContent=E.description();renderHealth();
     clearDelete();await refreshEditor(true);try{await loadCaches();}catch(e){notify(P.safeError(e));}
     clearPromptDelete();try{await refreshPromptPresets();}catch(e){$('promptPresetCount').textContent='프리셋 읽기 실패 · 저장 데이터는 유지합니다.';notify(e.message);}
-    await api.showContainer('fullscreen');
+    await api.showContainer('fullscreen');uiVisible=true;renderHealth();
   }
   hookLifecycle=ChronicleLifecycle.create(api,beforeRequest,{onChange:renderHealth,safeError:redact});
   // Expose the UI before any host permission prompt can stall or disappear.
@@ -1094,8 +1099,8 @@
   await api.registerButton({name:'Chronicle Memory',icon:'📜',iconType:'html',location:'chat'},openSettings);
   const onClick=event=>{if(event.target?.id==='stopWait')stopWaiting();};
   const onVisibility=()=>{
+    renderHealth();
     if(document.visibilityState!=='hidden'){
-      renderHealth();
       if(activeOperation()&&document.getElementById('status'))notify(`${activeOperation().label} 응답을 기다리고 있습니다. 기다리기 중단을 선택할 수 있으며 자동으로 중복 재시도하지 않습니다.`);
     }
   };
@@ -1104,7 +1109,8 @@
     document.addEventListener('visibilitychange',onVisibility);
   }
   if(typeof api.onUnload==='function')await api.onUnload(async()=>{
-    unloaded=true;
+    unloaded=true;uiVisible=false;
+    if(waitTimer!==null){clearTimeout(waitTimer);waitTimer=null;}
     if(startupTimer!==null){clearTimeout(startupTimer);startupTimer=null;}
     for(const op of activeOperations){op.stopped=true;op.stop(waitError('CHRONICLE_WAIT_STOPPED','플러그인이 종료되어 기억 호출 결과를 반영하지 않습니다.'));}
     if(typeof document!=='undefined'&&typeof document.removeEventListener==='function'){

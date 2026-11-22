@@ -34,7 +34,7 @@ function documentMock() {
   return {doc,all,Option:function(text,value){this.textContent=text;this.value=value;},get:id=>{assert(ids.has(id),`missing element ${id}`);return ids.get(id);}};
 }
 async function setup(mode='denied',extra={}) {
-  const dom=documentMock(),store=new Map(),hooks=[],requests=[],revoked=[];let start,visible=false,unload,open,resolvePermission;
+  const dom=documentMock(),store=new Map(),hooks=[],requests=[],revoked=[];let start,visible=false,unload,open,resolvePermission;const timers=new Map();let timerId=0;
   store.set('risu-chronicle:v1:settings',JSON.stringify({enabled:true,...extra.settings}));
   store.set('risu-chronicle:v1:health',JSON.stringify({status:'ok',message:'이전 실행의 요약 완료 기록',at:'2026-11-18T10:00:00Z'}));
   const message=Array.from({length:10},(_,i)=>[{role:'user',data:`입력 ${i+1}`,chatId:`u${i+1}`},{role:'char',data:`응답 ${i+1}`,chatId:`a${i+1}`}]).flat();
@@ -48,9 +48,9 @@ async function setup(mode='denied',extra={}) {
     ...(extra.api?extra.api(char,store):{})};
   if(extra.prepare)await extra.prepare(char,store);
   await vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../Chronicle_Memory.js'),'utf8'),{risuai:api,document:dom.doc,Option:dom.Option,URL:FileURL,Blob,TextEncoder,structuredClone,crypto:globalThis.crypto,
-    setTimeout:fn=>{start=fn;return 1;},clearTimeout:()=>{start=null;},console});
+    setTimeout:(fn,ms)=>{if(ms===2500){start=fn;return 'startup';}const id=++timerId;timers.set(id,fn);return id;},clearTimeout:id=>{if(id==='startup')start=null;else timers.delete(id);},console,...(extra.clock?{Date:extra.clock}:{})});
   const settle=async()=>{await new Promise(r=>setImmediate(r));};
-  return {...dom,char,store,hooks,requests,revoked,settle,open:()=>open(),start:()=>start?.(),unload:()=>unload(),visible:()=>visible,
+  return {...dom,char,store,hooks,requests,revoked,settle,timers,tick:()=>{const pending=[...timers.values()];timers.clear();pending.forEach(fn=>fn());},open:()=>open(),start:()=>start?.(),unload:()=>unload(),visible:()=>visible,
     setMode:value=>{mode=value;},resolve:()=>resolvePermission(),click:async id=>{await dom.get(id).onclick();await settle();}};
 }
 test('the real bundle keeps denied hook state separate from a previous successful summary',async()=>{
@@ -179,4 +179,29 @@ test('settings tabs keep unsaved fields and support keyboard navigation while ch
   const chunks=h.all.filter(e=>e.dataset.chunkId);assert.equal(chunks.length,2);assert(chunks.every(e=>e.tagName==='details'&&!e.open));
   await h.click('tab-basic');assert.equal(h.get('customPrompt').value,'저장 전 지침');
   assert.match(h.doc.head.innerHTML,/position:sticky/);assert.match(h.doc.head.innerHTML,/prefers-reduced-motion|transition/);
+});
+
+test('v1.0 elapsed wait diagnostics warn after three minutes, retain stopped calls, and clean up timers',async()=>{
+  let now=Date.now(),release;const calls=[];
+  class Clock extends Date{static now(){return now;}}
+  const h=await setup('granted',{clock:Clock,settings:{summaryBlocking:'nonblocking'},api:()=>({runLLMModel:opts=>{calls.push(opts);return new Promise(resolve=>release=resolve);}})});
+  await h.open();await h.click('ensureHook');
+  const input=h.char.chats[0].message.map(m=>({role:m.role==='char'?'assistant':'user',content:m.data,memo:m.chatId}));
+  await h.hooks[0](input,'model');assert.equal(calls.length,1);assert.match(h.get('health').textContent,/0초 경과/);assert.match(h.get('health').textContent,/미처리 원문 10턴/);assert.equal(h.timers.size,1);
+  now+=181000;h.tick();assert.match(h.get('health').textContent,/3분 1초 경과/);assert.match(h.get('health').textContent,/오래 지연/);assert.equal(h.get('health').dataset.warning,'true');
+  assert.equal(calls.length,1);assert.equal(h.timers.size,1);
+  // Background work must remain visible after the next RP refreshes health to ok.
+  h.char.chats[0].message.push({role:'user',data:'이어서',chatId:'u11'},{role:'char',data:'계속',chatId:'a11'});
+  await h.hooks[0](input,'model');assert.match(h.get('health').textContent,/미처리 원문 11턴/);assert.match(h.get('health').textContent,/오래 지연/);
+  h.doc.listeners.get('click')({target:{id:'stopWait'}});await h.settle();assert.match(h.get('health').textContent,/이전 호출이 끝날 때까지/);assert.equal(calls.length,1);
+  // Hiding or closing settings stops UI polling; reopening restores the elapsed status.
+  h.doc.visibilityState='hidden';h.doc.listeners.get('visibilitychange')();assert.equal(h.timers.size,0);
+  h.doc.visibilityState='visible';h.doc.listeners.get('visibilitychange')();assert.equal(h.timers.size,1);
+  await h.click('close');assert.equal(h.timers.size,0);await h.open();assert.equal(h.timers.size,1);
+  release({type:'fail',result:'late failure'});await h.settle();assert.equal(h.timers.size,0);assert(!h.get('health').textContent.includes('이전 호출이 끝날 때까지'));
+  assert.equal(JSON.parse(h.store.get(STATE_KEY)).entries.length,0);await h.unload();assert.equal(h.timers.size,0);
+});
+test('v1.0 search diagnostics show saved chunk ranges and semantic scores without a new model call',async()=>{
+  const h=await setup('denied',{prepare:async(char,store)=>{await twoChunks(char,store);store.set('risu-chronicle:v1:recall:qa-character:qa-chat',JSON.stringify({method:'semantic+keyword',indexed:2,total:2,selected:[{from:1,to:5,semantic:0.81234,keywords:['출발']}],text:'선택한 기록'}));}});
+  await h.open();assert.match(h.get('recallState').textContent,/T1~T5 · 유사도 0.812 · 출발/);assert.match(h.get('storageUsage').textContent,/기록·보관함 [0-9.]+ KiB · 벡터 캐시/);assert.equal(h.get('recallPreview').value,'선택한 기록');
 });

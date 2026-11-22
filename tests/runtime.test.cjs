@@ -6,7 +6,8 @@ const fs=require('node:fs');const vm=require('node:vm');const path=require('node
 const C=require('../core.cjs');
 const P=require('../providers.cjs'),R=require('../retrieval.cjs'),S=require('../storage.cjs'),E=require('../platform.cjs');
 const L=require('../lifecycle.cjs');
-const chunk=rows=>({from:rows[0].turn,to:rows.at(-1).turn,title:'임무 기록',keywords:['정찰','보상'],events:[{date:'1073.05.03',time:'저녁',summary:'정찰 임무의 보상 조건을 합의함.'}]});
+const turnsOf=content=>{const data=typeof content==='string'?JSON.parse(content):content;return Array.isArray(data)?data:data.turns;};
+const chunk=input=>{const rows=turnsOf(input);return {from:rows[0].turn,to:rows.at(-1).turn,title:'임무 기록',keywords:['정찰','보상'],events:[{date:'1073.05.03',time:'저녁',summary:'정찰 임무의 보상 조건을 합의함.'}]};};
 function raw(n,pending=true){return Array.from({length:n},(_,i)=>[{role:'user',data:`입력${i+1}`,chatId:`u${i+1}`},{role:'char',data:`응답${i+1}`,chatId:`a${i+1}`}]).flat().concat(pending?[{role:'user',data:'다음',chatId:`u${n+1}`}]:[]);}
 function formatted(r){return [{role:'system',content:'규칙'},...r.map(m=>({role:m.role==='char'?'assistant':'user',content:m.data,memo:m.chatId}))];}
 async function setup(override={},change={}){
@@ -20,7 +21,7 @@ async function setup(override={},change={}){
     registerSetting:async(_name,fn)=>{registrations++;hooks.open=fn;},registerButton:async()=>{registrations++;},
     onUnload:async fn=>{hooks.unload=fn;},
     runLLMModel:async opts=>{calls.push(opts);if(change.onCall) return change.onCall(opts,char);
-      const data=JSON.parse(opts.messages[1].content);return {type:'success',result:JSON.stringify(chunk(data))};},
+      const data=turnsOf(opts.messages[1].content);return {type:'success',result:JSON.stringify(chunk(data))};},
     nativeFetch:async(url,opts)=>{calls.push({url,opts});if(change.onFetch)return change.onFetch(url,opts,char);return change.externalResponse || new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(chunk([1,2,3,4,5].map(turn=>({turn}))))}}]}),{status:200});},
     ...change.api
   };
@@ -89,7 +90,7 @@ test('summary instruction changes affect only the next new chunk and never regen
 test('staircase advances at commits, survives reload and keeps extra raw after a failed next chunk',async()=>{
   let n=0;const h=await setup({rawTrim:'chunk',batchesPerRequest:2},{onCall:async opts=>{
     if(++n===3)return {type:'fail',result:'next chunk failed'};
-    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+    return {type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))};
   }});
   await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');assert.equal(C.covered(h.getState()),10);
   const id=h.getState().entries[0].id;
@@ -158,18 +159,18 @@ test('disabled memory passes through an unsupported browser without creating war
 });
 test('completed chunks survive a failed later batch and reload retries only the remaining chunk',async()=>{
   let calls=0;const first=await setup({batchesPerRequest:2},{onCall:async opts=>{
-    calls++;return calls===2?{type:'fail',result:'temporary interruption'}:{type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+    calls++;return calls===2?{type:'fail',result:'temporary interruption'}:{type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))};
   }});
   await first.hooks.beforeRequest(formatted(first.char.chats[0].message),'model');const id=first.getState().entries[0].id;
   assert.equal(C.covered(first.getState()),5);assert.equal(JSON.parse(first.store.get('risu-chronicle:v1:health')).status,'warning');
   const resumed=await setup({}, {store:first.store});await resumed.hooks.beforeRequest(formatted(resumed.char.chats[0].message),'model');
-  assert.equal(resumed.calls.length,1);assert.deepEqual(JSON.parse(resumed.calls[0].messages[1].content).map(row=>row.turn),[6,7,8,9,10]);
+  assert.equal(resumed.calls.length,1);assert.deepEqual(turnsOf(resumed.calls[0].messages[1].content).map(row=>row.turn),[6,7,8,9,10]);
   assert.equal(C.covered(resumed.getState()),10);assert.equal(resumed.getState().entries[0].id,id);
   assert.equal(JSON.parse(resumed.store.get('risu-chronicle:v1:health')).status,'ok');
 });
 test('processing status is persisted while a summary is pending, without a timeout or duplicate call',async()=>{
   let finish,started;const began=new Promise(r=>started=r),release=new Promise(r=>finish=r);
-  const h=await setup({}, {onCall:async opts=>{started();await release;return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};}});
+  const h=await setup({}, {onCall:async opts=>{started();await release;return {type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))};}});
   const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began;
   assert.equal(JSON.parse(h.store.get('risu-chronicle:v1:health')).status,'running');assert.equal(h.calls.length,1);
   finish();await task;assert.equal(JSON.parse(h.store.get('risu-chronicle:v1:health')).status,'ok');assert.equal(h.calls.length,1);
@@ -196,7 +197,7 @@ test('a stopped request rejecting late cannot write errors or block future summa
   class Clock extends Date{static now(){return now;}}
   const h=await setup({}, {document:doc,clock:Clock,onCall:async opts=>{
     if(++n===1){began.resolve();return reply.promise;}
-    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+    return {type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))};
   }});
   const input=formatted(h.char.chats[0].message),task=h.hooks.beforeRequest(input,'model');await began.promise;
   doc.listeners.click({target:{id:'stopWait'}});await task;const saved=JSON.stringify(h.getState());
@@ -218,7 +219,7 @@ test('stopping a later batch preserves a completed chunk and keeps the unfinishe
   const doc=waitDocument(),began=controlled(),reply=controlled();let n=0;
   const h=await setup({batchesPerRequest:2},{document:doc,onCall:async opts=>{
     if(++n===2){began.resolve();return reply.promise;}
-    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+    return {type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))};
   }});
   const task=h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');await began.promise;
   const id=h.getState().entries[0].id;doc.listeners.click({target:{id:'stopWait'}});const out=await task;
@@ -240,7 +241,7 @@ test('stopping a hybrid embedding wait keeps summary state and falls back withou
 test('full-source guard detects a same-length early edit while the last message and count stay unchanged',async()=>{
   const h=await setup({}, {onCall:async(opts,char)=>{
     const old=char.chats[0].message[1].data;char.chats[0].message[1].data='변경1';assert.equal(old.length,'변경1'.length);
-    return {type:'success',result:JSON.stringify(chunk(JSON.parse(opts.messages[1].content)))};
+    return {type:'success',result:JSON.stringify(chunk(turnsOf(opts.messages[1].content)))};
   }});
   await assert.rejects(()=>h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model'),/대화\/원문이 바뀌어/);
   assert.equal(h.getState().entries.length,0);
@@ -264,7 +265,7 @@ for(const mode of ['standalone','hybrid'])test(`${mode}: six normal turns follow
     if(n<10)assert.equal(h.calls.length,0);
   }
   assert.equal(h.calls.length,1);
-  const batch=JSON.parse(h.calls[0].messages[1].content);
+  const batch=turnsOf(h.calls[0].messages[1].content);
   assert.deepEqual(batch.map(t=>t.turn),[6,7,8,9,10]);
   assert.deepEqual(batch[1].messages.map(m=>m.role),['assistant']);
   const state=h.getState();assert.equal(state.entries.length,2);
@@ -293,7 +294,7 @@ for(const scope of ['all','recent','none'])test(`Risu cooperation ${scope}: summ
   assert.deepEqual(out.filter(m=>m.memo!==C.MARK),incoming);assert.deepEqual(h.char.chats[0].message,original);
   assert.equal(state.entries.length,2);assert.equal(state.lastWarning||'','');
   assert.equal(h.calls.length,2);assert(h.calls.every(c=>!c.url));
-  assert.deepEqual(h.calls.map(c=>JSON.parse(c.messages[1].content).map(t=>t.turn)),[[1,2,3,4,5],[6,7,8,9,10]]);
+  assert.deepEqual(h.calls.map(c=>turnsOf(c.messages[1].content).map(t=>t.turn)),[[1,2,3,4,5],[6,7,8,9,10]]);
   assert(h.calls.every(c=>c.messages[0].content.includes('약 150글자')));
   assert.equal(state.lastSummaryInput.summaryTargetChars,150);
   const text=out.find(m=>m.memo===C.MARK)?.content||'';
@@ -311,7 +312,7 @@ test('Risu cooperation failure leaves native input intact without fabricating mi
 });
 test('native thought-wrapped final JSON commits turns 16–20 without losing native memory or storing reasoning',async()=>{
   const h=await setup({mode:'risu'},{onCall:async opts=>{
-    const rows=JSON.parse(opts.messages[1].content);
+    const rows=turnsOf(opts.messages[1].content);
     return {type:'success',result:`<Thoughts>MODEL_REASONING_ONLY</Thoughts>\n${JSON.stringify(chunk(rows))}`};
   }});
   h.char.chats[0].message=raw(20);const tl=await C.timeline(h.char.chats[0].message);let state=C.emptyState();
@@ -340,7 +341,7 @@ test('switching into Risu cooperation preserves old manual logs and switching ba
 });
 for(const mode of ['standalone','hybrid'])test(`${mode}: an oversized valid summary advances memory and applies the recent-raw window without retrying`,async()=>{
   const h=await setup({mode},{onCall:async opts=>{
-    const rows=JSON.parse(opts.messages[1].content);
+    const rows=turnsOf(opts.messages[1].content);
     return {type:'success',result:JSON.stringify({...chunk(rows),events:Array.from({length:25},(_,i)=>({date:'',time:'',summary:`사건${i}: `+'정보'.repeat(100)}))})};
   }});
   const original=structuredClone(h.char.chats[0].message),tl=await C.timeline(original);
@@ -394,7 +395,7 @@ test('legacy append migrates to hybrid, trims recent raw, and warns about the ch
   const out=await h.hooks.beforeRequest(input,'model');
   assert(!out.some(m=>m.memo==='u1'));assert(out.some(m=>m.memo==='u6'));
   assert.match(h.getState().lastWarning,/이전 추가 주입 모드/);
-  const rows=JSON.parse(h.calls[0].messages[1].content);
+  const rows=turnsOf(h.calls[0].messages[1].content);
   assert.deepEqual(rows.map(t=>t.turn),[1,2,3,4,5]);
   assert.equal(rows[0].context.botCardName,'테스트 캐릭터');
 });
@@ -609,4 +610,18 @@ test('v0.8.0 summary requests use the card name for {{char}} and a neutral label
   await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
   assert.match(h.calls[0].messages[1].content,/테스트 캐릭터가 사용자의 손을 잡았다/);
   assert.equal(h.getState().entries[0].hash,(await C.timeline(h.char.chats[0].message)).turns[4].hash);
+});
+test('v0.8.0 the next summary references the saved, user-edited previous chunk read-only',async()=>{
+  const h=await setup();await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  assert(!JSON.parse(h.calls[0].messages[1].content).previous);
+  const key='risu-chronicle:v1:chat:character-1:chat-1',state=h.getState();
+  state.entries[0].text='수정됨 — 리아가 내일 정오 시장에서 보자고 약속함.';state.entries[0].title='시장 약속';state.revision++;h.store.set(key,JSON.stringify(state));
+  await h.hooks.beforeRequest(formatted(h.char.chats[0].message),'model');
+  const data=JSON.parse(h.calls[1].messages[1].content);
+  assert.deepEqual(data.previous,{from:1,to:5,title:'시장 약속',lastEvents:['수정됨 — 리아가 내일 정오 시장에서 보자고 약속함.']});
+  assert.deepEqual(data.turns.map(t=>t.turn),[6,7,8,9,10]);
+  assert.equal(h.getState().entries[0].text,'수정됨 — 리아가 내일 정오 시장에서 보자고 약속함.');
+  const off=await setup({summaryContext:'none'});await off.hooks.beforeRequest(formatted(off.char.chats[0].message),'model');
+  await off.hooks.beforeRequest(formatted(off.char.chats[0].message),'model');
+  assert(Array.isArray(JSON.parse(off.calls[1].messages[1].content)));
 });
